@@ -8,10 +8,16 @@ import random
 import time
 from typing import Tuple
 
-import gymnasium as gym
+# SB3 expects classic gym spaces on some environments (e.g. Python 3.6 on Expanse)
+try:  # Prefer legacy gym if present (e.g. on clusters with SB3<2.0)
+    import gym  # type: ignore
+    from gym import spaces
+except ImportError:  # Fall back to gymnasium when gym is unavailable
+    import gymnasium as gym
+    from gymnasium import spaces
+
 import numpy as np
 import pybullet as p
-from gymnasium import spaces
 from stable_baselines3 import DQN
 from stable_baselines3.common.callbacks import BaseCallback
 
