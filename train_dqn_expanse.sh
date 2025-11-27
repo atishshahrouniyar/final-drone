@@ -9,9 +9,9 @@
 # Job Name: Name for your job (e.g., in squeue)
 #SBATCH --job-name="dqn_training"
 
-# Output/Error Files: Where SLURM writes stdout/stderr. %j is the Job ID.
-#SBATCH --output="/home/arouniyar/drones/slurm_logs/dqn_training.%j.out"
-#SBATCH --error="/home/arouniyar/drones/slurm_logs/dqn_training.%j.err"
+# Output/Error Files: placed in a local slurm_logs folder next to this script.
+#SBATCH --output="slurm_logs/dqn_training.%j.out"
+#SBATCH --error="slurm_logs/dqn_training.%j.err"
 
 # Partition: MUST be 'gpu-shared' for cost-effective 1-GPU runs.
 #SBATCH --partition=gpu-shared
@@ -57,10 +57,12 @@ export SCRATCH_DIR="$SLURM_TMPDIR"
 # This is the *persistent* Lustre storage for FINAL results.
 export FINAL_OUTPUT_DIR="/home/arouniyar/drones/lidar"
 
+LOG_DIR="$SLURM_SUBMIT_DIR/slurm_logs"
+
 # Create these directories
 mkdir -p $SCRATCH_DIR
 mkdir -p $FINAL_OUTPUT_DIR
-mkdir -p "/home/arouniyar/drones/slurm_logs"
+mkdir -p "$LOG_DIR"
 
 echo "Node-Local Scratch (for high-freq I/O): $SCRATCH_DIR"
 echo "Persistent Lustre (for final results): $FINAL_OUTPUT_DIR"
