@@ -1,0 +1,12 @@
+/_pycache/
+/logs/
+/models/
+/slurm_logs/
+/data/
+/results/
+/tmp/
+/__pycache__/
+/__pycache__/
+detailed_logs/
+tensorboard_logs/
+*.zip
