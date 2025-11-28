@@ -15,6 +15,7 @@ import time
 from typing import Tuple
 
 import numpy as np
+import pybullet as p
 from stable_baselines3 import DQN
 
 from train_dqn import RandomPointNavEnv
@@ -82,6 +83,14 @@ def test_model(
 
                 if hasattr(env.scene, "_update_camera"):
                     env.scene._update_camera()
+                if hasattr(env.scene, "client") and env.scene.client is not None:
+                    try:
+                        pos, orn = p.getBasePositionAndOrientation(env.scene.drone_id, physicsClientId=env.scene.client)
+                        yaw = p.getEulerFromQuaternion(orn)[2]
+                        lidar_hits = env._get_lidar(pos, yaw)
+                        env.scene._render_lidar_overlay(pos, yaw, lidar_hits)
+                    except Exception:
+                        pass
 
                 ep_reward += reward
                 steps += 1
@@ -114,7 +123,7 @@ def test_model(
 
 if __name__ == "__main__":
     model_path = sys.argv[1] if len(sys.argv) > 1 else "download/dqn_random_point_nav"
-    num_eps = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+    num_eps = int(sys.argv[2]) if len(sys.argv) > 2 else 20
     max_steps = int(sys.argv[3]) if len(sys.argv) > 3 else 4000
 
     test_model(model_path=model_path, num_episodes=num_eps, max_steps_per_episode=max_steps)

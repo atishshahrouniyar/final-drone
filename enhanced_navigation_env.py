@@ -125,6 +125,7 @@ class EnhancedForestWithObstacles:
         self.camera_yaw_offset = 0.0
         self._camera_yaw = self.camera_yaw_offset
         self._camera_pitch = self.camera_pitch
+        self.show_lidar_overlay = False
 
         
         # Drone scale factor (to make drone bigger/more visible)
@@ -150,6 +151,7 @@ class EnhancedForestWithObstacles:
         
         # Initial camera setup
         self._update_camera()
+        self._lidar_indicator = {"handles": [], "update_every": 1, "last_update": 0}
 
     def _valid(self, x, y, min_sep=0.8):
         """Simple rejection check to avoid heavy overlaps; keeps clearing if requested."""
@@ -521,33 +523,17 @@ class EnhancedForestWithObstacles:
             # Create a simple drone placeholder (box with 4 propellers)
             self.drone_id = self._create_simple_drone([0, 0, 1.0])
         else:
-            # Load the actual drone URDF
             print(f"Loading drone from: {drone_urdf}")
-            init_position = [0, 0, 1.0]  # Start at center, 1m above ground
+            init_position = [0, 0, 1.0]
             init_orientation = p.getQuaternionFromEuler([0, 0, 0])
-            
+
             self.drone_id = p.loadURDF(
                 drone_urdf,
                 init_position,
                 init_orientation,
                 flags=p.URDF_USE_INERTIA_FROM_FILE,
-                physicsClientId=self.client
+                physicsClientId=self.client,
             )
-            
-            # Add a visible marker sphere around the drone to make it more prominent
-            # PyBullet doesn't easily scale URDF models, so we use a visual aid
-            if scale != 1.0:
-                print(f"Adding visual marker for drone visibility (scale factor: {scale})")
-                # Create a semi-transparent sphere marker that will follow the drone
-                # This helps visualize the drone's position even when the URDF model is small
-                self.drone_marker_vis = p.createVisualShape(
-                    p.GEOM_SPHERE,
-                    radius=0.15 * scale,  # Visible marker radius
-                    rgbaColor=[1.0, 0.3, 0.3, 0.3],  # Semi-transparent red marker
-                    physicsClientId=self.client
-                )
-                # The marker will be updated in the run loop to follow the drone
-                self.drone_marker_id = None  # Will be created/updated in _update_camera or run loop
         
         # Store initial position for reference
         self.drone_position = np.array([0, 0, 1.0])
@@ -619,22 +605,6 @@ class EnhancedForestWithObstacles:
             self.drone_position = np.array(pos)
             self.drone_velocity = np.array(vel)
 
-            if hasattr(self, 'drone_marker_vis') and self.drone_marker_vis is not None:
-                try:
-                    if hasattr(self, 'drone_marker_id') and self.drone_marker_id is not None:
-                        p.resetBasePositionAndOrientation(
-                            self.drone_marker_id, pos, [0, 0, 0, 1], physicsClientId=self.client
-                        )
-                    else:
-                        self.drone_marker_id = p.createMultiBody(
-                            baseMass=0,
-                            baseVisualShapeIndex=self.drone_marker_vis,
-                            basePosition=pos,
-                            physicsClientId=self.client,
-                        )
-                except Exception:
-                    pass
-
             self._handle_camera_input()
 
             camera_target = pos
@@ -664,8 +634,63 @@ class EnhancedForestWithObstacles:
             except Exception:
                 pass
 
+    def _render_lidar_overlay(self, drone_pos, drone_yaw, lidar_hits):
+        """Render lidar beams as debug lines around the drone."""
+        if not getattr(self, "show_lidar_overlay", False):
+            return
+        indicator = getattr(self, "_lidar_indicator", None)
+        if indicator is None or self.client is None:
+            return
+
+        indicator["last_update"] += 1
+        if indicator["last_update"] < indicator["update_every"]:
+            return
+        indicator["last_update"] = 0
+
+        try:
+            if indicator["handles"]:
+                for handle in indicator["handles"]:
+                    p.removeUserDebugItem(handle, physicsClientId=self.client)
+                indicator["handles"] = []
+        except Exception:
+            pass
+
+        safe_color = [0.1, 0.8, 0.1]
+        warn_color = [0.9, 0.6, 0.1]
+        danger_color = [0.9, 0.1, 0.1]
+
+        angle = drone_yaw
+        for frac in lidar_hits:
+            dist = frac * self.lidar_range if hasattr(self, "lidar_range") else frac * 8.0
+            endpoint = [
+                drone_pos[0] + dist * math.cos(angle),
+                drone_pos[1] + dist * math.sin(angle),
+                drone_pos[2],
+            ]
+
+            color = safe_color
+            if dist < 1.0:
+                color = danger_color
+            elif dist < 2.0:
+                color = warn_color
+
+            try:
+                handle = p.addUserDebugLine(
+                    lineFromXYZ=drone_pos,
+                    lineToXYZ=endpoint,
+                    lineColorRGB=color,
+                    lineWidth=2.0,
+                    lifeTime=0.2,
+                    physicsClientId=self.client,
+                )
+                indicator["handles"].append(handle)
+            except Exception:
+                break
+
+            angle += 2 * math.pi / len(lidar_hits)
+
     def _handle_camera_input(self):
-        """Arrow keys change camera yaw/pitch; +/- change distance."""
+        """Arrow keys change camera yaw/pitch, +/- zoom, 'l' toggles lidar overlay."""
         try:
             keys = p.getKeyboardEvents(physicsClientId=self.client)
         except Exception:
@@ -683,10 +708,27 @@ class EnhancedForestWithObstacles:
             self._camera_pitch = max(-89.0, self._camera_pitch - delta_pitch)
         if keys.get(p.B3G_DOWN_ARROW, 0) & p.KEY_IS_DOWN:
             self._camera_pitch = min(-5.0, self._camera_pitch + delta_pitch)
-        if keys.get(ord('+'), 0) & p.KEY_IS_DOWN:
+        zoom_in_codes = [ord('+'), ord('='), getattr(p, "B3G_NUMPAD_PLUS", None)]
+        zoom_out_codes = [ord('-'), ord('_'), getattr(p, "B3G_NUMPAD_MINUS", None)]
+
+        if any(code is not None and keys.get(code, 0) & p.KEY_IS_DOWN for code in zoom_in_codes):
             self.camera_distance = max(2.0, self.camera_distance - delta_zoom)
-        if keys.get(ord('-'), 0) & p.KEY_IS_DOWN:
+        if any(code is not None and keys.get(code, 0) & p.KEY_IS_DOWN for code in zoom_out_codes):
             self.camera_distance = min(25.0, self.camera_distance + delta_zoom)
+
+        if keys.get(ord('l'), 0) & p.KEY_WAS_TRIGGERED:
+            self.show_lidar_overlay = not self.show_lidar_overlay
+            state = "ON" if self.show_lidar_overlay else "OFF"
+            print(f"Lidar overlay: {state}")
+            if not self.show_lidar_overlay:
+                indicator = getattr(self, "_lidar_indicator", None)
+                if indicator and indicator.get("handles"):
+                    for handle in indicator["handles"]:
+                        try:
+                            p.removeUserDebugItem(handle, physicsClientId=self.client)
+                        except Exception:
+                            pass
+                    indicator["handles"] = []
 
     def _control_drone(self):
         """Simple control to make drone hover and move around."""
