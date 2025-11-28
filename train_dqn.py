@@ -8,17 +8,18 @@ import random
 import time
 from typing import Tuple
 
-# SB3 expects classic gym spaces on some environments (e.g. Python 3.6 on Expanse)
-try:  # Prefer legacy gym if present (e.g. on clusters with SB3<2.0)
-    import gym  # type: ignore
-    from gym import spaces
-except ImportError:  # Fall back to gymnasium when gym is unavailable
+from packaging import version
+
+try:
     import gymnasium as gym
     from gymnasium import spaces
+except ImportError:  # older stacks
+    import gym  # type: ignore
+    from gym import spaces  # type: ignore
 
 import numpy as np
 import pybullet as p
-from stable_baselines3 import DQN
+from stable_baselines3 import DQN, __version__ as SB3_VERSION
 from stable_baselines3.common.callbacks import BaseCallback
 
 from enhanced_navigation_env import EnhancedForestWithObstacles
@@ -40,6 +41,8 @@ PROXIMITY_THRESHOLD = 1.0
 PROXIMITY_PENALTY = -0.5
 COLLISION_PENALTY = -5.0
 SUCCESS_REWARD = 20.0
+
+USE_GYMNASIUM_API = version.parse(SB3_VERSION) >= version.parse("2.0.0")
 
 
 class TrainingLogger(BaseCallback):
@@ -142,7 +145,9 @@ class RandomPointNavEnv(gym.Env):
 
         self.prev_dist = np.linalg.norm(self.goal_pos[:2] - start[:2])
         obs = self._get_obs()
-        return obs, {}
+        if USE_GYMNASIUM_API:
+            return obs, {}
+        return obs
 
     def step(self, action: int):
         action_vec = self.action_map[int(action)]
@@ -193,8 +198,11 @@ class RandomPointNavEnv(gym.Env):
                                            self.goal_pos[0] - new_pos[0]) - yaw + math.pi) % (2 * math.pi) - math.pi)],
                              dtype=np.float32)]
         )
-
-        return obs, reward, terminated, truncated, {}
+        info = {}
+        if USE_GYMNASIUM_API:
+            return obs, reward, terminated, truncated, info
+        else:
+            return obs, reward, (terminated or truncated), info
 
     # ---------------------------------------------------------------- utilities
     def _get_lidar(self, pos, yaw):

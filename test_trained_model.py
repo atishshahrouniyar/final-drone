@@ -14,7 +14,7 @@ import numpy as np
 from stable_baselines3 import DQN
 from train_dqn import DroneNavGymEnv
 
-def test_model(model_path="dqn_detailed_model", num_episodes=10, max_steps_per_episode=1000):
+def test_model(model_path="dqn_detailed_model", num_episodes=10, max_steps_per_episode=1000000):
     """
     Load and test a trained DQN model with GUI visualization.
     
