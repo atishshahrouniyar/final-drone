@@ -122,7 +122,7 @@ class RandomPointNavEnv(gym.Env):
 
         # Observation space: lidar(36) + goal distance + goal angle
         self.lidar_rays = 36
-        self.lidar_range = 8.0
+        self.lidar_range = 3.0
         low = np.array([0.0] * self.lidar_rays + [0.0, -np.pi], dtype=np.float32)
         high = np.array([1.0] * self.lidar_rays + [1.0, np.pi], dtype=np.float32)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
