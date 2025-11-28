@@ -17,7 +17,7 @@ from typing import Tuple
 import numpy as np
 from stable_baselines3 import DQN
 
-from train_dqn import RandomPointNavEnv, USE_GYMNASIUM_API
+from train_dqn import RandomPointNavEnv
 
 
 def _unwrap_reset(obs_result):
@@ -52,9 +52,6 @@ def test_model(
         print("✓ Model loaded successfully")
     except FileNotFoundError:
         print(f"✗ Model file not found: {model_path}.zip")
-        return
-    except Exception as exc:
-        print(f"✗ Failed to load model: {exc}")
         return
 
     print("\nCreating GUI environment...")

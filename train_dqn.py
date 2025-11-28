@@ -41,14 +41,8 @@ CHECKPOINT_MILESTONES = [500_000]
 EVAL_FREQUENCY = 50_000
 EVAL_EPISODES = 5
 
-USE_GYMNASIUM_API = version.parse(SB3_VERSION) >= version.parse("2.0.0")
-
-if USE_GYMNASIUM_API:
-    import gymnasium as gym
-    from gymnasium import spaces
-else:
-    import gym  # type: ignore
-    from gym import spaces  # type: ignore
+import gymnasium as gym
+from gymnasium import spaces
 
 
 class TrainingLogger(BaseCallback):
@@ -176,9 +170,7 @@ class RandomPointNavEnv(gym.Env):
 
         self.prev_dist = np.linalg.norm(self.goal_pos[:2] - start[:2])
         obs = self._get_obs()
-        if USE_GYMNASIUM_API:
-            return obs, {}
-        return obs
+        return obs, {}
 
     def step(self, action: int):
         action_vec = self.action_map[int(action)]
@@ -230,10 +222,7 @@ class RandomPointNavEnv(gym.Env):
                              dtype=np.float32)]
         )
         info = {}
-        if USE_GYMNASIUM_API:
-            return obs, reward, terminated, truncated, info
-        else:
-            return obs, reward, (terminated or truncated), info
+        return obs, reward, terminated, truncated, info
 
     # ---------------------------------------------------------------- utilities
     def _get_lidar(self, pos, yaw):
