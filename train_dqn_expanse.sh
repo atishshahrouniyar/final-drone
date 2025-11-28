@@ -18,7 +18,8 @@ set -euo pipefail
 echo "SLURM job ${SLURM_JOB_ID:-N/A} running on ${HOSTNAME}"
 echo "Working directory: ${SLURM_SUBMIT_DIR}"
 
-
+module load anaconda3/2021.05/q4munrg || true
+source /cm/shared/apps/spack/0.17.3/cpu/b/opt/spack/linux-rocky8-zen/gcc-8.5.0/anaconda3-2021.05-q4munrgvh7qp4o7r3nzcdkbuph4z7375/etc/profile.d/conda.sh
 conda activate /home/arouniyar/drones
 
 which python
