@@ -119,10 +119,13 @@ class EnhancedForestWithObstacles:
         # Load drone
         self._load_drone()
         
-        # Camera settings for following drone (zoomed in for better visibility)
-        self.camera_distance = 4.0  # Distance from drone (reduced for zoom)
-        self.camera_pitch = -30.0   # Camera angle (less steep for better view)
-        self.camera_yaw_offset = 45.0  # Camera yaw offset (degrees)
+        # Camera settings for following drone (user adjustable via arrow keys)
+        self.camera_distance = 6.0
+        self.camera_pitch = -35.0
+        self.camera_yaw_offset = 0.0
+        self._camera_yaw = self.camera_yaw_offset
+        self._camera_pitch = self.camera_pitch
+
         
         # Drone scale factor (to make drone bigger/more visible)
         self.drone_scale = 2.0  # Scale factor for drone size
@@ -606,74 +609,84 @@ class EnhancedForestWithObstacles:
 
     def _update_camera(self):
         """Update camera to follow the drone position dynamically."""
-        if not hasattr(self, 'drone_id'):
+        if not hasattr(self, 'drone_id') or self.client is None:
             return
-        
+
         try:
-            # Get current drone position and velocity
             pos, orn = p.getBasePositionAndOrientation(self.drone_id, physicsClientId=self.client)
             vel, _ = p.getBaseVelocity(self.drone_id, physicsClientId=self.client)
-            
+
             self.drone_position = np.array(pos)
             self.drone_velocity = np.array(vel)
-            
-            # Update visible marker if it exists (for URDF drones to make them more visible)
+
             if hasattr(self, 'drone_marker_vis') and self.drone_marker_vis is not None:
                 try:
                     if hasattr(self, 'drone_marker_id') and self.drone_marker_id is not None:
-                        # Update existing marker position
                         p.resetBasePositionAndOrientation(
-                            self.drone_marker_id,
-                            pos,  # Same position as drone
-                            [0, 0, 0, 1],  # No rotation
-                            physicsClientId=self.client
+                            self.drone_marker_id, pos, [0, 0, 0, 1], physicsClientId=self.client
                         )
                     else:
-                        # Create marker for first time
-                        scale = getattr(self, 'drone_scale', 2.0)
                         self.drone_marker_id = p.createMultiBody(
                             baseMass=0,
                             baseVisualShapeIndex=self.drone_marker_vis,
                             basePosition=pos,
-                            physicsClientId=self.client
+                            physicsClientId=self.client,
                         )
                 except Exception:
                     pass
-            
-            # Camera always targets the drone's current position
+
+            self._handle_camera_input()
+
             camera_target = pos
-            
-            # Calculate camera yaw based on drone's movement direction
-            # If drone is moving, follow its direction; otherwise use default offset
             velocity_magnitude = np.linalg.norm(self.drone_velocity)
             if velocity_magnitude > 0.1:
-                # Camera follows behind the drone in the direction it's moving
-                movement_direction = math.atan2(self.drone_velocity[1], self.drone_velocity[0])
-                camera_yaw = math.degrees(movement_direction) + 180.0  # Behind the drone
-            else:
-                # If stationary, use default view angle
-                camera_yaw = self.camera_yaw_offset
-            
-            # Smoothly update camera to follow drone
+                movement_direction = math.degrees(math.atan2(self.drone_velocity[1], self.drone_velocity[0]))
+                auto_yaw = movement_direction + 180.0
+                blend = 0.9
+                self._camera_yaw = blend * self._camera_yaw + (1 - blend) * auto_yaw
+
             p.resetDebugVisualizerCamera(
                 cameraDistance=self.camera_distance,
-                cameraYaw=camera_yaw,
-                cameraPitch=self.camera_pitch,
+                cameraYaw=self._camera_yaw,
+                cameraPitch=self._camera_pitch,
                 cameraTargetPosition=camera_target,
-                physicsClientId=self.client
+                physicsClientId=self.client,
             )
-        except Exception as e:
-            # If drone doesn't exist yet, use default camera
+        except Exception:
             try:
                 p.resetDebugVisualizerCamera(
                     cameraDistance=12,
                     cameraYaw=45,
                     cameraPitch=-35,
                     cameraTargetPosition=[0, 0, 0],
-                    physicsClientId=self.client
+                    physicsClientId=self.client,
                 )
             except Exception:
                 pass
+
+    def _handle_camera_input(self):
+        """Arrow keys change camera yaw/pitch; +/- change distance."""
+        try:
+            keys = p.getKeyboardEvents(physicsClientId=self.client)
+        except Exception:
+            return
+
+        delta_yaw = 3.0
+        delta_pitch = 2.0
+        delta_zoom = 0.3
+
+        if keys.get(p.B3G_LEFT_ARROW, 0) & p.KEY_IS_DOWN:
+            self._camera_yaw -= delta_yaw
+        if keys.get(p.B3G_RIGHT_ARROW, 0) & p.KEY_IS_DOWN:
+            self._camera_yaw += delta_yaw
+        if keys.get(p.B3G_UP_ARROW, 0) & p.KEY_IS_DOWN:
+            self._camera_pitch = max(-89.0, self._camera_pitch - delta_pitch)
+        if keys.get(p.B3G_DOWN_ARROW, 0) & p.KEY_IS_DOWN:
+            self._camera_pitch = min(-5.0, self._camera_pitch + delta_pitch)
+        if keys.get(ord('+'), 0) & p.KEY_IS_DOWN:
+            self.camera_distance = max(2.0, self.camera_distance - delta_zoom)
+        if keys.get(ord('-'), 0) & p.KEY_IS_DOWN:
+            self.camera_distance = min(25.0, self.camera_distance + delta_zoom)
 
     def _control_drone(self):
         """Simple control to make drone hover and move around."""

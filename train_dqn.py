@@ -34,9 +34,9 @@ GOAL_MAX_DIST = 5.0
 SUCCESS_THRESHOLD = 0.5
 PROXIMITY_THRESHOLD = 1.0
 PROXIMITY_PENALTY = -0.5
-COLLISION_PENALTY = -5.0
+COLLISION_PENALTY = -15.0
 SUCCESS_REWARD = 20.0
-CHECKPOINT_DIR = "./checkpoints"
+RUNS_ROOT = "./runs"
 CHECKPOINT_MILESTONES = [500_000]
 EVAL_FREQUENCY = 50_000
 EVAL_EPISODES = 5
@@ -266,15 +266,24 @@ class RandomPointNavEnv(gym.Env):
 
 
 def train():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(RUNS_ROOT, timestamp)
+    checkpoint_dir = os.path.join(run_dir, "checkpoints")
+    tensorboard_dir = os.path.join(run_dir, "tensorboard")
+    eval_log_dir = os.path.join(run_dir, "eval_logs")
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(tensorboard_dir, exist_ok=True)
+    os.makedirs(eval_log_dir, exist_ok=True)
+
     env = Monitor(RandomPointNavEnv(gui=False))
     eval_env = Monitor(RandomPointNavEnv(gui=False))
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    checkpoint_cb = MilestoneCheckpoint(CHECKPOINT_MILESTONES, CHECKPOINT_DIR)
+    checkpoint_cb = MilestoneCheckpoint(CHECKPOINT_MILESTONES, checkpoint_dir)
     eval_cb = EvalCallback(
         eval_env,
-        best_model_save_path=CHECKPOINT_DIR,
-        log_path=CHECKPOINT_DIR,
+        best_model_save_path=checkpoint_dir,
+        log_path=eval_log_dir,
         eval_freq=EVAL_FREQUENCY,
         n_eval_episodes=EVAL_EPISODES,
         deterministic=True,
@@ -295,15 +304,14 @@ def train():
         train_freq=4,
         gradient_steps=1,
         verbose=1,
-        tensorboard_log="./tensorboard_logs/",
+        tensorboard_log=tensorboard_dir,
         device="auto",
     )
 
     try:
         model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callback)
     finally:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_path = f"dqn_random_point_nav_{timestamp}"
+        model_path = os.path.join(run_dir, f"dqn_random_point_nav_{timestamp}")
         model.save(model_path)
         print(f"Saved model to {model_path}.zip")
         env.close()
