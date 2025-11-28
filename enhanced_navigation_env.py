@@ -608,13 +608,6 @@ class EnhancedForestWithObstacles:
             self._handle_camera_input()
 
             camera_target = pos
-            velocity_magnitude = np.linalg.norm(self.drone_velocity)
-            if velocity_magnitude > 0.1:
-                movement_direction = math.degrees(math.atan2(self.drone_velocity[1], self.drone_velocity[0]))
-                auto_yaw = movement_direction + 180.0
-                blend = 0.9
-                self._camera_yaw = blend * self._camera_yaw + (1 - blend) * auto_yaw
-
             p.resetDebugVisualizerCamera(
                 cameraDistance=self.camera_distance,
                 cameraYaw=self._camera_yaw,
