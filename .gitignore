@@ -10,3 +10,4 @@
 detailed_logs/
 tensorboard_logs/
 *.zip
+checkpoints/

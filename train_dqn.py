@@ -15,6 +15,7 @@ import numpy as np
 import pybullet as p
 from stable_baselines3 import DQN, __version__ as SB3_VERSION
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, EvalCallback
+from stable_baselines3.common.monitor import Monitor
 
 from enhanced_navigation_env import EnhancedForestWithObstacles
 
@@ -276,8 +277,8 @@ class RandomPointNavEnv(gym.Env):
 
 
 def train():
-    env = RandomPointNavEnv(gui=False)
-    eval_env = RandomPointNavEnv(gui=False)
+    env = Monitor(RandomPointNavEnv(gui=False))
+    eval_env = Monitor(RandomPointNavEnv(gui=False))
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
     checkpoint_cb = MilestoneCheckpoint(CHECKPOINT_MILESTONES, CHECKPOINT_DIR)
