@@ -13,8 +13,6 @@
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
 
-set -euo pipefail
-
 echo "SLURM job ${SLURM_JOB_ID:-N/A} running on ${HOSTNAME}"
 echo "Working directory: ${SLURM_SUBMIT_DIR}"
 
