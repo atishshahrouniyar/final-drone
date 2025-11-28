@@ -1,131 +1,124 @@
 #!/usr/bin/env python3
 """
-Test and visualize trained DQN model with GUI enabled.
+Visualize the trained random-point navigation policy with PyBullet GUI.
 
 Usage:
-    python test_trained_model.py [model_path]
-    
-If model_path is not provided, defaults to "dqn_detailed_model"
+    python test_trained_model.py [model_path] [num_episodes] [max_steps]
+Defaults:
+    model_path      = "dqn_random_point_nav"
+    num_episodes    = 5
+    max_steps       = 400
 """
 
 import sys
 import time
+from typing import Tuple
+
 import numpy as np
 from stable_baselines3 import DQN
-from train_dqn import DroneNavGymEnv
 
-def test_model(model_path="dqn_detailed_model", num_episodes=10, max_steps_per_episode=1000000):
+from train_dqn import RandomPointNavEnv, USE_GYMNASIUM_API
+
+
+def _unwrap_reset(obs_result):
+    """Handle both Gymnasium (obs, info) and Gym (obs) reset signatures."""
+    if isinstance(obs_result, tuple):
+        return obs_result[0]
+    return obs_result
+
+
+def _unwrap_step(step_result: Tuple):
     """
-    Load and test a trained DQN model with GUI visualization.
-    
-    Args:
-        model_path: Path to the saved model (without .zip extension)
-        num_episodes: Number of episodes to run
-        max_steps_per_episode: Maximum steps per episode
+    Normalize step outputs to (obs, reward, terminated, truncated, info)
+    regardless of Gym/Gymnasium version.
     """
-    print("=" * 60)
-    print("Loading trained DQN model...")
-    print("=" * 60)
-    
+    if len(step_result) == 5:
+        return step_result
+    obs, reward, done, info = step_result
+    return obs, reward, done, False, info
+
+
+def test_model(
+    model_path: str = "dqn_random_point_nav",
+    num_episodes: int = 5,
+    max_steps_per_episode: int = 400,
+):
+    print("=" * 70)
+    print(f"Loading trained model from: {model_path}")
+    print("=" * 70)
+
     try:
-        # Load the trained model
         model = DQN.load(model_path)
-        print(f"✓ Model loaded successfully from: {model_path}")
+        print("✓ Model loaded successfully")
     except FileNotFoundError:
-        print(f"✗ Error: Model file not found: {model_path}")
-        print(f"  Looking for: {model_path}.zip")
-        print("\nAvailable files in current directory:")
-        import os
-        for f in os.listdir('.'):
-            if 'dqn' in f.lower() or 'model' in f.lower():
-                print(f"  - {f}")
+        print(f"✗ Model file not found: {model_path}.zip")
         return
-    except Exception as e:
-        print(f"✗ Error loading model: {e}")
+    except Exception as exc:
+        print(f"✗ Failed to load model: {exc}")
         return
-    
-    print("\n" + "=" * 60)
-    print("Creating environment with GUI enabled...")
-    print("=" * 60)
-    
-    # Create environment with GUI enabled
-    env = DroneNavGymEnv(gui=True)
-    
-    print("\n" + "=" * 60)
-    print(f"Running {num_episodes} episodes...")
-    print("Press Ctrl+C to stop early")
-    print("=" * 60)
-    
+
+    print("\nCreating GUI environment...")
+    env = RandomPointNavEnv(gui=True)
     episode_rewards = []
     episode_lengths = []
-    
+
     try:
-        for episode in range(num_episodes):
-            obs, info = env.reset()
-            
-            # Update camera to follow the drone at episode start
-            if hasattr(env, 'scene') and hasattr(env.scene, '_update_camera'):
+        for episode in range(1, num_episodes + 1):
+            obs = _unwrap_reset(env.reset())
+
+            start = getattr(env, "start_pos", None)
+            goal = getattr(env, "goal_pos", None)
+            if start is not None and goal is not None:
+                print(f"Start: ({start[0]:.2f}, {start[1]:.2f})  ->  Goal: ({goal[0]:.2f}, {goal[1]:.2f})")
+            if hasattr(env.scene, "_update_camera"):
                 env.scene._update_camera()
-            
-            episode_reward = 0
-            episode_length = 0
-            done = False
-            
-            print(f"\n--- Episode {episode + 1}/{num_episodes} ---")
-            
-            while not done and episode_length < max_steps_per_episode:
-                # Get action from the trained model (deterministic)
+
+            ep_reward = 0.0
+            steps = 0
+            terminated = truncated = False
+
+            print(f"\n--- Episode {episode}/{num_episodes} ---")
+
+            while not (terminated or truncated) and steps < max_steps_per_episode:
                 action, _ = model.predict(obs, deterministic=True)
-                
-                # Step the environment
-                obs, reward, terminated, truncated, info = env.step(action)
-                done = terminated or truncated
-                
-                # Update camera to follow the drone
-                if hasattr(env, 'scene') and hasattr(env.scene, '_update_camera'):
+                obs, reward, terminated, truncated, info = _unwrap_step(env.step(action))
+
+                if hasattr(env.scene, "_update_camera"):
                     env.scene._update_camera()
-                
-                episode_reward += reward
-                episode_length += 1
-                
-                # Small delay for visualization
+
+                ep_reward += reward
+                steps += 1
                 time.sleep(0.01)
-            
-            episode_rewards.append(episode_reward)
-            episode_lengths.append(episode_length)
-            
-            status = "SUCCESS" if episode_length < max_steps_per_episode else "TIMEOUT"
-            print(f"  Reward: {episode_reward:.2f}, Steps: {episode_length}, Status: {status}")
-            
-            # Wait a bit between episodes
-            time.sleep(1.0)
-    
+
+            episode_rewards.append(ep_reward)
+            episode_lengths.append(steps)
+            status = "SUCCESS" if terminated and not truncated else "TIMEOUT"
+            print(f"Reward: {ep_reward:.2f} | Steps: {steps} | Status: {status}")
+            time.sleep(0.5)
+
     except KeyboardInterrupt:
-        print("\n\nInterrupted by user.")
-    
+        print("\nInterrupted by user.")
+
     finally:
-        # Print statistics
         if episode_rewards:
-            print("\n" + "=" * 60)
-            print("Episode Statistics:")
-            print("=" * 60)
-            print(f"Total Episodes: {len(episode_rewards)}")
-            print(f"Average Reward: {np.mean(episode_rewards):.2f} ± {np.std(episode_rewards):.2f}")
-            print(f"Average Length: {np.mean(episode_lengths):.2f} ± {np.std(episode_lengths):.2f}")
-            print(f"Best Reward: {np.max(episode_rewards):.2f}")
-            print(f"Worst Reward: {np.min(episode_rewards):.2f}")
-            print("=" * 60)
-        
+            print("\n" + "=" * 70)
+            print("Episode statistics")
+            print("=" * 70)
+            print(f"Episodes run: {len(episode_rewards)}")
+            print(f"Average reward: {np.mean(episode_rewards):.2f} ± {np.std(episode_rewards):.2f}")
+            print(f"Average length: {np.mean(episode_lengths):.1f} ± {np.std(episode_lengths):.1f}")
+            print(f"Best reward: {np.max(episode_rewards):.2f}")
+            print(f"Worst reward: {np.min(episode_rewards):.2f}")
+
         print("\nClosing environment...")
         env.close()
-        print("Done!")
+        print("Done.")
+
 
 if __name__ == "__main__":
-    # Get model path from command line argument or use default
-    model_path = sys.argv[1] if len(sys.argv) > 1 else "dqn_detailed_model"
-    
-    # Get number of episodes from command line or use default
-    num_episodes = int(sys.argv[2]) if len(sys.argv) > 2 else 10
-    
-    test_model(model_path=model_path, num_episodes=num_episodes)
+    model_path = sys.argv[1] if len(sys.argv) > 1 else "dqn_random_point_nav"
+    num_eps = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+    max_steps = int(sys.argv[3]) if len(sys.argv) > 3 else 400
+
+    test_model(model_path=model_path, num_episodes=num_eps, max_steps_per_episode=max_steps)
 

@@ -4,7 +4,7 @@ inside a 40x40 PyBullet environment while avoiding obstacles.
 """
 
 import math
-import random
+from datetime import datetime
 import time
 from typing import Tuple
 
@@ -19,7 +19,7 @@ from enhanced_navigation_env import EnhancedForestWithObstacles
 
 
 # --------------------------- configuration ------------------------------------
-TOTAL_TIMESTEPS = 5_000_000
+TOTAL_TIMESTEPS = 3_000_000
 LEARNING_RATE = 2e-4
 BUFFER_SIZE = 200_000
 BATCH_SIZE = 128
@@ -106,12 +106,15 @@ class RandomPointNavEnv(gym.Env):
 
         self.goal_pos = np.zeros(3, dtype=np.float32)
         self.prev_dist = None
+        self.start_pos = None
+        self._rng = np.random.default_rng()
+        self.start_pos = None
 
     # ------------------------------------------------------------------ helpers
     def _sample_valid_point(self, margin: float = 2.0) -> Tuple[float, float]:
         for _ in range(100):
-            r = random.uniform(margin, self.radius - margin)
-            ang = random.uniform(0, 2 * math.pi)
+            r = self._rng.uniform(margin, self.radius - margin)
+            ang = self._rng.uniform(0, 2 * math.pi)
             x = r * math.cos(ang)
             y = r * math.sin(ang)
             if self.scene._valid(x, y, min_sep=0.5):
@@ -120,8 +123,8 @@ class RandomPointNavEnv(gym.Env):
 
     def _sample_goal(self, start_xy: np.ndarray) -> np.ndarray:
         for _ in range(100):
-            dist = random.uniform(GOAL_MIN_DIST, GOAL_MAX_DIST)
-            ang = random.uniform(0, 2 * math.pi)
+            dist = self._rng.uniform(GOAL_MIN_DIST, GOAL_MAX_DIST)
+            ang = self._rng.uniform(0, 2 * math.pi)
             gx = start_xy[0] + dist * math.cos(ang)
             gy = start_xy[1] + dist * math.sin(ang)
             if math.hypot(gx, gy) <= self.radius - 1.0 and self.scene._valid(gx, gy, min_sep=0.5):
@@ -131,12 +134,11 @@ class RandomPointNavEnv(gym.Env):
     # ---------------------------------------------------------------------- Gym
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
+        self._rng = np.random.default_rng(int(self.np_random.integers(1 << 63)))
 
         sx, sy = self._sample_valid_point()
         start = np.array([sx, sy, 1.0], dtype=np.float32)
+        self.start_pos = start.copy()
         self.goal_pos = self._sample_goal(start[:2])
 
         p.resetBasePositionAndOrientation(self.drone_id, start.tolist(), [0, 0, 0, 1], physicsClientId=self.client)
@@ -270,7 +272,10 @@ def train():
     try:
         model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callback)
     finally:
-        model.save("dqn_random_point_nav")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_path = f"dqn_random_point_nav_{timestamp}"
+        model.save(model_path)
+        print(f"Saved model to {model_path}.zip")
         env.close()
 
 
