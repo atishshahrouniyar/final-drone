@@ -10,13 +10,6 @@ from typing import Tuple
 
 from packaging import version
 
-try:
-    import gymnasium as gym
-    from gymnasium import spaces
-except ImportError:  # older stacks
-    import gym  # type: ignore
-    from gym import spaces  # type: ignore
-
 import numpy as np
 import pybullet as p
 from stable_baselines3 import DQN, __version__ as SB3_VERSION
@@ -43,6 +36,13 @@ COLLISION_PENALTY = -5.0
 SUCCESS_REWARD = 20.0
 
 USE_GYMNASIUM_API = version.parse(SB3_VERSION) >= version.parse("2.0.0")
+
+if USE_GYMNASIUM_API:
+    import gymnasium as gym
+    from gymnasium import spaces
+else:
+    import gym  # type: ignore
+    from gym import spaces  # type: ignore
 
 
 class TrainingLogger(BaseCallback):
