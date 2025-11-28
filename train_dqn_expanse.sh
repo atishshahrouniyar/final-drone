@@ -25,7 +25,7 @@ module purge
 module load cpu/0.17.3b || true        # harmless if module absent
 module load anaconda3/2021.05/q4munrg || true  # use default anaconda if available
 
-source ~/.bashrc
+
 conda activate /home/arouniyar/drones
 
 which python
