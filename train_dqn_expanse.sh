@@ -23,7 +23,7 @@ echo "Working directory: ${SLURM_SUBMIT_DIR}"
 # -----------------------------------------------------------------------
 module purge
 module load gpu || true        # harmless if module absent
-module load anaconda3 || true  # use default anaconda if available
+module load anaconda3/2021.05/q4munrg || true  # use default anaconda if available
 
 source ~/.bashrc
 conda activate /home/arouniyar/drones
