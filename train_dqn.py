@@ -4,6 +4,7 @@ inside a 40x40 PyBullet environment while avoiding obstacles.
 """
 
 import math
+import os
 from datetime import datetime
 import time
 from typing import Tuple
@@ -13,13 +14,13 @@ from packaging import version
 import numpy as np
 import pybullet as p
 from stable_baselines3 import DQN, __version__ as SB3_VERSION
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList, EvalCallback
 
 from enhanced_navigation_env import EnhancedForestWithObstacles
 
 
 # --------------------------- configuration ------------------------------------
-TOTAL_TIMESTEPS = 3_000_000
+TOTAL_TIMESTEPS = 1_000_000
 LEARNING_RATE = 2e-4
 BUFFER_SIZE = 200_000
 BATCH_SIZE = 128
@@ -34,6 +35,10 @@ PROXIMITY_THRESHOLD = 1.0
 PROXIMITY_PENALTY = -0.5
 COLLISION_PENALTY = -5.0
 SUCCESS_REWARD = 20.0
+CHECKPOINT_DIR = "./checkpoints"
+CHECKPOINT_MILESTONES = [500_000]
+EVAL_FREQUENCY = 50_000
+EVAL_EPISODES = 5
 
 USE_GYMNASIUM_API = version.parse(SB3_VERSION) >= version.parse("2.0.0")
 
@@ -58,6 +63,29 @@ class TrainingLogger(BaseCallback):
             elapsed = max(time.time() - self.start_time, 1e-6)
             fps = self.num_timesteps / elapsed
             self.logger.record("custom/fps", fps)
+        return True
+
+
+class MilestoneCheckpoint(BaseCallback):
+    """Save checkpoints at predefined timesteps."""
+
+    def __init__(self, milestones, save_dir, prefix="dqn_random_point_nav"):
+        super().__init__()
+        self.milestones = sorted(milestones)
+        self.save_dir = save_dir
+        self.prefix = prefix
+        self.saved = set()
+        os.makedirs(self.save_dir, exist_ok=True)
+
+    def _on_step(self) -> bool:
+        for milestone in self.milestones:
+            if milestone in self.saved:
+                continue
+            if self.num_timesteps >= milestone:
+                path = os.path.join(self.save_dir, f"{self.prefix}_{milestone // 1000}k")
+                self.model.save(path)
+                print(f"[Checkpoint] Saved model at {milestone:,} steps -> {path}.zip")
+                self.saved.add(milestone)
         return True
 
 
@@ -249,7 +277,19 @@ class RandomPointNavEnv(gym.Env):
 
 def train():
     env = RandomPointNavEnv(gui=False)
-    callback = TrainingLogger()
+    eval_env = RandomPointNavEnv(gui=False)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+    checkpoint_cb = MilestoneCheckpoint(CHECKPOINT_MILESTONES, CHECKPOINT_DIR)
+    eval_cb = EvalCallback(
+        eval_env,
+        best_model_save_path=CHECKPOINT_DIR,
+        log_path=CHECKPOINT_DIR,
+        eval_freq=EVAL_FREQUENCY,
+        n_eval_episodes=EVAL_EPISODES,
+        deterministic=True,
+    )
+    callback = CallbackList([TrainingLogger(), checkpoint_cb, eval_cb])
 
     model = DQN(
         "MlpPolicy",
@@ -277,6 +317,7 @@ def train():
         model.save(model_path)
         print(f"Saved model to {model_path}.zip")
         env.close()
+        eval_env.close()
 
 
 if __name__ == "__main__":

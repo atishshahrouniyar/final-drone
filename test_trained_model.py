@@ -116,9 +116,9 @@ def test_model(
 
 
 if __name__ == "__main__":
-    model_path = sys.argv[1] if len(sys.argv) > 1 else "dqn_random_point_nav"
+    model_path = sys.argv[1] if len(sys.argv) > 1 else "dqn_random_point_nav_20251128_081136"
     num_eps = int(sys.argv[2]) if len(sys.argv) > 2 else 5
-    max_steps = int(sys.argv[3]) if len(sys.argv) > 3 else 400
+    max_steps = int(sys.argv[3]) if len(sys.argv) > 3 else 4000
 
     test_model(model_path=model_path, num_episodes=num_eps, max_steps_per_episode=max_steps)
 
