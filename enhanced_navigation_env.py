@@ -42,6 +42,10 @@ NUM_LOGS = 8
 NUM_MUSHROOM_CLUSTERS = 14
 LEAF_CLUMPS = 50
 NUM_OBSTACLES = 10  # Number of explicit navigation obstacles
+NUM_HUMANS = 2
+HUMAN_HEIGHT = 1.6
+HUMAN_RADIUS = 0.2
+HUMAN_COLOR = [0.98, 0.38, 0.08, 1.0]
 
 CLEARING = True
 CLEARING_RADIUS = 2.0  # keep a small clearing around center (optional)
@@ -93,6 +97,9 @@ class EnhancedForestWithObstacles:
 
         # store placed object centers and radius for collision avoidance
         self.placed = []
+        self.human_ids = []
+        self.human_positions = []
+        self.human_label_ids = []
 
         # start pybullet
         self.client = p.connect(p.GUI if gui else p.DIRECT)
@@ -115,6 +122,7 @@ class EnhancedForestWithObstacles:
         self._place_mushrooms()
         self._place_leaf_clumps()
         self._place_center_marker()
+        self._place_humans()
 
         # Load drone
         self._load_drone()
@@ -152,6 +160,106 @@ class EnhancedForestWithObstacles:
         # Initial camera setup
         self._update_camera()
         self._lidar_indicator = {"handles": [], "update_every": 1, "last_update": 0}
+    def reposition_humans(self):
+        """Randomize human locations (called each episode)."""
+        if not self.human_ids:
+            self._place_humans()
+            return
+        for idx, human_id in enumerate(self.human_ids):
+            pos = self._sample_human_spot()
+            self.human_positions[idx] = pos
+            p.resetBasePositionAndOrientation(
+                human_id, pos, [0, 0, 0, 1], physicsClientId=self.client
+            )
+            self._update_human_label(idx, pos)
+
+    def _place_humans(self):
+        """Spawn bright capsules representing humans."""
+        self._clear_human_labels()
+        self.human_ids = []
+        self.human_positions = []
+        self.human_label_ids = []
+        for i in range(NUM_HUMANS):
+            pos = self._sample_human_spot()
+            if pos is None:
+                continue
+            human_id = self._create_human_body(pos, HUMAN_COLOR)
+            if human_id is not None:
+                self.human_ids.append(human_id)
+                self.human_positions.append(pos)
+                self.human_label_ids.append(self._create_human_label(pos))
+
+    def _sample_human_spot(self):
+        for _ in range(60):
+            x, y = rand_in_disk(self.radius * 0.85)
+            if self._valid(x, y, min_sep=0.8):
+                return [x, y, HUMAN_HEIGHT / 2.0]
+        return None
+
+    def _create_human_body(self, position, color):
+        try:
+            coll = p.createCollisionShape(
+                p.GEOM_CYLINDER,
+                radius=HUMAN_RADIUS,
+                height=HUMAN_HEIGHT,
+                physicsClientId=self.client,
+            )
+            vis = p.createVisualShape(
+                p.GEOM_CYLINDER,
+                radius=HUMAN_RADIUS,
+                length=HUMAN_HEIGHT,
+                rgbaColor=color,
+                physicsClientId=self.client,
+            )
+            human_id = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=coll,
+                baseVisualShapeIndex=vis,
+                basePosition=position,
+                physicsClientId=self.client,
+            )
+            return human_id
+        except Exception:
+            return None
+
+    def _create_human_label(self, position):
+        try:
+            return p.addUserDebugText(
+                "H",
+                [position[0], position[1], position[2] + HUMAN_HEIGHT / 2.0 + 0.3],
+                textColorRGB=[1.0, 1.0, 0.2],
+                textSize=1.4,
+                lifeTime=0,
+                physicsClientId=self.client,
+            )
+        except Exception:
+            return None
+
+    def _update_human_label(self, idx, position):
+        label_id = None
+        if idx < len(self.human_label_ids):
+            label_id = self.human_label_ids[idx]
+        if label_id is not None:
+            try:
+                p.removeUserDebugItem(label_id, physicsClientId=self.client)
+            except Exception:
+                pass
+        new_id = self._create_human_label(position)
+        if idx < len(self.human_label_ids):
+            self.human_label_ids[idx] = new_id
+        else:
+            self.human_label_ids.append(new_id)
+
+    def _clear_human_labels(self):
+        if not self.human_label_ids:
+            return
+        for label_id in self.human_label_ids:
+            if label_id is None:
+                continue
+            try:
+                p.removeUserDebugItem(label_id, physicsClientId=self.client)
+            except Exception:
+                pass
 
     def _valid(self, x, y, min_sep=0.8):
         """Simple rejection check to avoid heavy overlaps; keeps clearing if requested."""
@@ -478,15 +586,13 @@ class EnhancedForestWithObstacles:
                 break
 
     def _place_center_marker(self):
-        """Add small start marker and text so you can see spawn center."""
-        vis = p.createVisualShape(p.GEOM_SPHERE, radius=0.08, rgbaColor=[0.08, 0.7, 0.08, 0.95],
-                                  physicsClientId=self.client)
-        p.createMultiBody(baseMass=0, baseVisualShapeIndex=vis, basePosition=[0, 0, 0.08], physicsClientId=self.client)
-        try:
-            p.addUserDebugText("START", [0.0, -0.8, 0.02], textColorRGB=[0.02, 0.6, 0.02], textSize=1.2,
-                               physicsClientId=self.client)
-        except Exception:
-            pass
+        """Add small start marker sphere without text."""
+        vis = p.createVisualShape(
+            p.GEOM_SPHERE, radius=0.08, rgbaColor=[0.08, 0.7, 0.08, 0.95], physicsClientId=self.client
+        )
+        p.createMultiBody(
+            baseMass=0, baseVisualShapeIndex=vis, basePosition=[0, 0, 0.08], physicsClientId=self.client
+        )
 
     def _load_drone(self):
         """Load a drone at the center of the clearing."""

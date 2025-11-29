@@ -21,6 +21,25 @@ from stable_baselines3 import DQN
 from train_dqn import RandomPointNavEnv
 
 
+def _detect_human_pixels(image: np.ndarray):
+    """Simple color-threshold detection for hi-vis human props."""
+    if image is None or image.size == 0:
+        return False, None, 0
+    rgb = image[:, :, :3]
+    mask = (
+        (rgb[:, :, 0] > 200)
+        & (rgb[:, :, 1] > 80)
+        & (rgb[:, :, 1] < 210)
+        & (rgb[:, :, 2] < 140)
+    )
+    count = int(np.count_nonzero(mask))
+    if count < 150:
+        return False, None, count
+    ys, xs = np.where(mask)
+    center = (int(xs.mean()), int(ys.mean()))
+    return True, center, count
+
+
 def _unwrap_reset(obs_result):
     """Handle both Gymnasium (obs, info) and Gym (obs) reset signatures."""
     if isinstance(obs_result, tuple):
@@ -74,6 +93,7 @@ def test_model(
             ep_reward = 0.0
             steps = 0
             terminated = truncated = False
+            human_spotted = False
 
             print(f"\n--- Episode {episode}/{num_episodes} ---")
 
@@ -91,6 +111,14 @@ def test_model(
                         env.scene._render_lidar_overlay(pos, yaw, lidar_hits)
                     except Exception:
                         pass
+
+                camera_frame = None
+                if hasattr(env.scene, "_get_drone_camera_image"):
+                    camera_frame = env.scene._get_drone_camera_image()
+                detected, center, pix_count = _detect_human_pixels(camera_frame)
+                if detected and not human_spotted:
+                    print(f"  ✓ Human detected through camera at pixels {center} (mask={pix_count})")
+                    human_spotted = True
 
                 ep_reward += reward
                 steps += 1

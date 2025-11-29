@@ -158,6 +158,8 @@ class RandomPointNavEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self._rng = np.random.default_rng(int(self.np_random.integers(1 << 63)))
+        if hasattr(self.scene, "reposition_humans"):
+            self.scene.reposition_humans()
 
         sx, sy = self._sample_valid_point()
         start = np.array([sx, sy, 1.0], dtype=np.float32)
