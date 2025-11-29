@@ -40,6 +40,8 @@ RUNS_ROOT = "./runs"
 CHECKPOINT_MILESTONES = [500_000]
 EVAL_FREQUENCY = 50_000
 EVAL_EPISODES = 5
+MIN_ALTITUDE = 1.0
+MAX_ALTITUDE = 3.0
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -120,11 +122,11 @@ class RandomPointNavEnv(gym.Env):
         }
         self.linear_speed = 3.0
 
-        # Observation space: lidar(36) + goal distance + goal angle
+        # Observation space: lidar(36) + goal distance + goal angle + altitude delta
         self.lidar_rays = 36
         self.lidar_range = 3.0
-        low = np.array([0.0] * self.lidar_rays + [0.0, -np.pi], dtype=np.float32)
-        high = np.array([1.0] * self.lidar_rays + [1.0, np.pi], dtype=np.float32)
+        low = np.array([0.0] * self.lidar_rays + [0.0, -np.pi, -1.0], dtype=np.float32)
+        high = np.array([1.0] * self.lidar_rays + [1.0, np.pi, 1.0], dtype=np.float32)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
         self.goal_pos = np.zeros(3, dtype=np.float32)
@@ -144,15 +146,18 @@ class RandomPointNavEnv(gym.Env):
                 return x, y
         return 0.0, 0.0
 
-    def _sample_goal(self, start_xy: np.ndarray) -> np.ndarray:
+    def _sample_goal(self, start_xyz: np.ndarray) -> np.ndarray:
         for _ in range(100):
             dist = self._rng.uniform(GOAL_MIN_DIST, GOAL_MAX_DIST)
             ang = self._rng.uniform(0, 2 * math.pi)
-            gx = start_xy[0] + dist * math.cos(ang)
-            gy = start_xy[1] + dist * math.sin(ang)
+            gx = start_xyz[0] + dist * math.cos(ang)
+            gy = start_xyz[1] + dist * math.sin(ang)
             if math.hypot(gx, gy) <= self.radius - 1.0 and self.scene._valid(gx, gy, min_sep=0.5):
-                return np.array([gx, gy, 1.0], dtype=np.float32)
-        return np.array([start_xy[0], start_xy[1], 1.0], dtype=np.float32)
+                gz = float(self._rng.uniform(MIN_ALTITUDE, MAX_ALTITUDE))
+                return np.array([gx, gy, gz], dtype=np.float32)
+        return np.array(
+            [start_xyz[0], start_xyz[1], float(self._rng.uniform(MIN_ALTITUDE, MAX_ALTITUDE))], dtype=np.float32
+        )
 
     # ---------------------------------------------------------------------- Gym
     def reset(self, seed=None, options=None):
@@ -162,15 +167,16 @@ class RandomPointNavEnv(gym.Env):
             self.scene.reposition_humans()
 
         sx, sy = self._sample_valid_point()
-        start = np.array([sx, sy, 1.0], dtype=np.float32)
+        sz = float(self._rng.uniform(MIN_ALTITUDE, MAX_ALTITUDE))
+        start = np.array([sx, sy, sz], dtype=np.float32)
         self.start_pos = start.copy()
-        self.goal_pos = self._sample_goal(start[:2])
+        self.goal_pos = self._sample_goal(start)
 
         p.resetBasePositionAndOrientation(self.drone_id, start.tolist(), [0, 0, 0, 1], physicsClientId=self.client)
         p.resetBaseVelocity(self.drone_id, [0, 0, 0], [0, 0, 0], physicsClientId=self.client)
         p.resetBasePositionAndOrientation(self.goal_id, self.goal_pos.tolist(), [0, 0, 0, 1], physicsClientId=self.client)
 
-        self.prev_dist = np.linalg.norm(self.goal_pos[:2] - start[:2])
+        self.prev_dist = np.linalg.norm(self.goal_pos - start)
         obs = self._get_obs()
         return obs, {}
 
@@ -189,9 +195,16 @@ class RandomPointNavEnv(gym.Env):
         for _ in range(ACTION_REPEAT):
             p.stepSimulation(physicsClientId=self.client)
 
-        new_pos, _ = p.getBasePositionAndOrientation(self.drone_id, physicsClientId=self.client)
+        new_pos, orn = p.getBasePositionAndOrientation(self.drone_id, physicsClientId=self.client)
         new_pos = np.array(new_pos)
-        dist_to_goal = np.linalg.norm(self.goal_pos[:2] - new_pos[:2])
+        if new_pos[2] < MIN_ALTITUDE or new_pos[2] > MAX_ALTITUDE:
+            clamped = new_pos.copy()
+            clamped[2] = np.clip(clamped[2], MIN_ALTITUDE, MAX_ALTITUDE)
+            p.resetBasePositionAndOrientation(
+                self.drone_id, clamped.tolist(), orn, physicsClientId=self.client
+            )
+            new_pos = clamped
+        dist_to_goal = np.linalg.norm(self.goal_pos - new_pos)
 
         lidar = self._get_lidar(new_pos, yaw)
         reward = 0.0
@@ -217,12 +230,12 @@ class RandomPointNavEnv(gym.Env):
             reward += SUCCESS_REWARD
             terminated = True
 
-        obs = np.concatenate(
-            [lidar, np.array([min(dist_to_goal / GOAL_MAX_DIST, 1.0),
-                              ((math.atan2(self.goal_pos[1] - new_pos[1],
-                                           self.goal_pos[0] - new_pos[0]) - yaw + math.pi) % (2 * math.pi) - math.pi)],
-                             dtype=np.float32)]
-        )
+        goal_dist_norm = min(dist_to_goal / GOAL_MAX_DIST, 1.0)
+        rel_angle = (math.atan2(self.goal_pos[1] - new_pos[1], self.goal_pos[0] - new_pos[0]) - yaw + math.pi) % (
+            2 * math.pi
+        ) - math.pi
+        altitude_delta = np.clip((self.goal_pos[2] - new_pos[2]) / (MAX_ALTITUDE - MIN_ALTITUDE), -1.0, 1.0)
+        obs = np.concatenate([lidar, np.array([goal_dist_norm, rel_angle, altitude_delta], dtype=np.float32)])
         info = {}
         return obs, reward, terminated, truncated, info
 
@@ -255,10 +268,11 @@ class RandomPointNavEnv(gym.Env):
         pos, orn = p.getBasePositionAndOrientation(self.drone_id, physicsClientId=self.client)
         yaw = p.getEulerFromQuaternion(orn)[2]
         lidar = self._get_lidar(pos, yaw)
-        dist = np.linalg.norm(self.goal_pos[:2] - np.array(pos[:2]))
+        dist = np.linalg.norm(self.goal_pos - np.array(pos))
         rel_angle = (math.atan2(self.goal_pos[1] - pos[1], self.goal_pos[0] - pos[0]) - yaw + math.pi) % (2 * math.pi) - math.pi
         goal_dist_norm = min(dist / GOAL_MAX_DIST, 1.0)
-        return np.concatenate([lidar, np.array([goal_dist_norm, rel_angle], dtype=np.float32)])
+        altitude_delta = np.clip((self.goal_pos[2] - pos[2]) / (MAX_ALTITUDE - MIN_ALTITUDE), -1.0, 1.0)
+        return np.concatenate([lidar, np.array([goal_dist_norm, rel_angle, altitude_delta], dtype=np.float32)])
 
     def close(self):
         try:
