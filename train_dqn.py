@@ -34,10 +34,12 @@ GOAL_MAX_DIST = 5.0
 SUCCESS_THRESHOLD = 0.3
 PROXIMITY_THRESHOLD = 0.1
 PROXIMITY_PENALTY = -0.5
-COLLISION_PENALTY = -15.0
+COLLISION_PENALTY = -40.0
 SUCCESS_REWARD = 20.0
 HUMAN_FOUND_REWARD = SUCCESS_REWARD
 HUMAN_DETECTION_RADIUS = 0.6
+MIN_SAFE_ALTITUDE = 0.6
+GROUND_CLEARANCE_PENALTY = -8.0
 RUNS_ROOT = "./runs"
 CHECKPOINT_MILESTONES = [500_000]
 EVAL_FREQUENCY = 50_000
@@ -207,6 +209,11 @@ class RandomPointNavEnv(gym.Env):
         # Proximity penalty
         reward += self._proximity_penalty(lidar)
 
+        # Strongly discourage skimming the ground (common failure mode)
+        if new_pos[2] < MIN_SAFE_ALTITUDE:
+            depth = MIN_SAFE_ALTITUDE - new_pos[2]
+            reward += GROUND_CLEARANCE_PENALTY * depth
+
         terminated = False
         truncated = False
         info = {"collision": False, "goal_reached": False, "human_found": False}
@@ -226,7 +233,7 @@ class RandomPointNavEnv(gym.Env):
                     info["human_found"] = True
                     break
 
-        # Success reward (goal marker) - no termination, just flag crossing
+        # Success reward (goal marker) - resample a fresh waypoint instead of ending episode
         if (
             not info["collision"]
             and not info["human_found"]
@@ -235,6 +242,11 @@ class RandomPointNavEnv(gym.Env):
         ):
             reward += SUCCESS_REWARD
             info["goal_reached"] = True
+            self.goal_pos = self._sample_goal(new_pos[:2])
+            self.prev_dist = np.linalg.norm(self.goal_pos[:2] - new_pos[:2])
+            p.resetBasePositionAndOrientation(
+                self.goal_id, self.goal_pos.tolist(), [0, 0, 0, 1], physicsClientId=self.client
+            )
 
         obs = np.concatenate(
             [lidar, np.array([min(dist_to_goal / GOAL_MAX_DIST, 1.0),
