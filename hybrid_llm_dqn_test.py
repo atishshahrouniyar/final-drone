@@ -14,7 +14,7 @@ import argparse
 import math
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pybullet as p
@@ -70,6 +70,136 @@ def _detect_human_pixels(image: np.ndarray) -> Tuple[bool, Tuple[int, int] | Non
     center = (int(xs.mean()), int(ys.mean()))
     return True, center, count
 
+
+def _estimate_detection_goal(
+    drone_pos: Sequence[float],
+    drone_yaw: float,
+    pixel: Tuple[int, int],
+    camera_width: int,
+    fov_deg: float,
+    distance: float = 4.0,
+) -> List[float]:
+    """Project a camera detection into world space roughly in front of the drone."""
+    if camera_width <= 0 or fov_deg <= 0:
+        return [float(drone_pos[0]), float(drone_pos[1]), float(drone_pos[2])]
+    offset_norm = ((pixel[0] / max(camera_width, 1)) - 0.5) * 2.0
+    yaw_offset = math.radians(fov_deg) * 0.5 * offset_norm
+    heading = drone_yaw + yaw_offset
+    return [
+        float(drone_pos[0]) + distance * math.cos(heading),
+        float(drone_pos[1]) + distance * math.sin(heading),
+        max(0.5, float(drone_pos[2])),
+    ]
+
+
+class PathVisualizer:
+    """Draws the flown path inside PyBullet."""
+
+    def __init__(self, client_id: int):
+        self.client_id = client_id
+        self.prev_pos: Tuple[float, float, float] | None = None
+        self.line_handles: List[int] = []
+
+    def update(self, pos: Sequence[float]) -> None:
+        point = (float(pos[0]), float(pos[1]), float(pos[2]))
+        if self.prev_pos is not None:
+            try:
+                handle = p.addUserDebugLine(
+                    self.prev_pos,
+                    point,
+                    [0.1, 0.7, 1.0],
+                    lineWidth=2.5,
+                    lifeTime=0,
+                    physicsClientId=self.client_id,
+                )
+                self.line_handles.append(handle)
+            except Exception:
+                pass
+        self.prev_pos = point
+
+    def clear(self) -> None:
+        for handle in self.line_handles:
+            try:
+                p.removeUserDebugItem(handle, physicsClientId=self.client_id)
+            except Exception:
+                pass
+        self.line_handles.clear()
+        self.prev_pos = None
+
+
+def _spawn_detection_marker(client_id: Optional[int], position: Sequence[float]) -> List[int]:
+    """Draw a crosshair marker around a suspected survivor location."""
+    if client_id is None:
+        return []
+    handles = []
+    offsets = [
+        ((0.5, 0, 0), (-0.5, 0, 0)),
+        ((0, 0.5, 0), (0, -0.5, 0)),
+        ((0, 0, 0.5), (0, 0, -0.5)),
+    ]
+    for start_off, end_off in offsets:
+        start = [
+            position[0] + start_off[0],
+            position[1] + start_off[1],
+            position[2] + start_off[2],
+        ]
+        end = [
+            position[0] + end_off[0],
+            position[1] + end_off[1],
+            position[2] + end_off[2],
+        ]
+        try:
+            handle = p.addUserDebugLine(
+                start,
+                end,
+                [1.0, 0.2, 0.2],
+                lineWidth=3.0,
+                lifeTime=0,
+                physicsClientId=client_id,
+            )
+            handles.append(handle)
+        except Exception:
+            pass
+    return handles
+
+
+def _clear_debug_items(client_id: Optional[int], handles: List[int]) -> None:
+    if client_id is None:
+        return
+    for handle in handles:
+        try:
+            p.removeUserDebugItem(handle, physicsClientId=client_id)
+        except Exception:
+            pass
+
+
+class SearchCoverageTracker:
+    """Coarse coverage map plus path logger."""
+
+    def __init__(self) -> None:
+        self.quadrant_counts: dict[str, int] = {"NE": 0, "NW": 0, "SE": 0, "SW": 0}
+        self.path_trace: List[Tuple[float, float, float]] = []
+
+    def update(self, pos: Sequence[float]) -> None:
+        x, y, z = map(float, pos[:3])
+        quad = self._quadrant_label(x, y)
+        self.quadrant_counts[quad] += 1
+        self.path_trace.append((x, y, z))
+
+    def summary(self) -> str:
+        counts = ", ".join(f"{q}:{c}" for q, c in self.quadrant_counts.items())
+        return f"Sector coverage -> {counts}."
+
+    @staticmethod
+    def _quadrant_label(x: float, y: float) -> str:
+        if x >= 0 and y >= 0:
+            return "NE"
+        if x < 0 and y >= 0:
+            return "NW"
+        if x >= 0 and y < 0:
+            return "SE"
+        return "SW"
+
 @dataclass
 class EpisodeSummary:
     reward: float
@@ -77,6 +207,7 @@ class EpisodeSummary:
     status: str
     llm_calls: int
     heuristic_calls: int
+    path_trace: List[Tuple[float, float, float]]
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,7 +218,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to the trained DQN model (.zip).",
     )
     parser.add_argument("--episodes", type=int, default=1, help="Number of evaluation episodes.")
-    parser.add_argument("--max-steps", type=int, default=600, help="Max steps per episode.")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=0,
+        help="Optional cap on steps per episode (0 = no limit).",
+    )
     parser.add_argument("--llm-interval", type=int, default=25, help="Steps between LLM refreshes.")
     parser.add_argument("--dist-threshold", type=float, default=0.6, help="Distance to sub-goal that triggers refresh.")
     parser.add_argument(
@@ -127,12 +263,24 @@ def run_episode(
     llm_calls = 0
     heuristic_calls = 0
     last_detection_report: str | None = None
+    coverage_tracker = SearchCoverageTracker()
+    client_id = getattr(env, "client", getattr(env.scene, "client", None))
+    path_viz = PathVisualizer(client_id) if client_id is not None else None
+    detection_goal: List[float] | None = None
+    detection_markers: List[int] = []
+    last_info: Dict[str, bool] = {}
 
     print(f"\n--- Episode {episode_idx} ---")
 
-    while not (terminated or truncated) and steps < max_steps:
+    max_steps_limit = max_steps if max_steps > 0 else None
+    step_limit_reached = False
+
+    while not (terminated or truncated) and (max_steps_limit is None or steps < max_steps_limit):
         pos, orn = p.getBasePositionAndOrientation(env.drone_id, physicsClientId=env.client)
         yaw = p.getEulerFromQuaternion(orn)[2]
+        coverage_tracker.update(pos)
+        if path_viz is not None:
+            path_viz.update(pos)
 
         if hasattr(env.scene, "_update_camera"):
             try:
@@ -149,6 +297,7 @@ def run_episode(
                 env.scene._render_lidar_overlay(pos, yaw, lidar_hits)
             except Exception:  # noqa: BLE001
                 pass
+        coverage_summary = coverage_tracker.summary()
         sensor_report = (
             last_detection_report
             if last_detection_report
@@ -163,15 +312,41 @@ def run_episode(
         if camera_frame is not None:
             detected, center, pix_count = _detect_human_pixels(camera_frame)
             if detected:
-                sensor_report = (
+                detection_text = (
                     f"Camera spotted a high-visibility target near pixel {center} "
                     f"(mask count {pix_count}). Investigate this bearing."
                 )
+                sensor_report = detection_text
                 last_detection_report = sensor_report
+                camera_width = int(getattr(env.scene, "drone_camera_width", camera_frame.shape[1]))
+                camera_fov = float(getattr(env.scene, "drone_camera_fov", 80.0))
+                detection_goal = _estimate_detection_goal(pos, yaw, center, camera_width, camera_fov)
+                _clear_debug_items(client_id, detection_markers)
+                detection_markers = _spawn_detection_marker(client_id, detection_goal)
             elif last_detection_report:
-                sensor_report = (
-                    f"No new visual detection; last report: {last_detection_report}"
-                )
+                sensor_report = f"No new visual detection; last report: {last_detection_report}"
+
+        sensor_report = f"{coverage_summary} {sensor_report}"
+
+        if detection_goal is not None:
+            if _distance(pos, detection_goal) < 0.5:
+                print("Detection target reached. Scanning area for survivors...")
+                detection_goal = None
+                _clear_debug_items(client_id, detection_markers)
+                detection_markers = []
+            else:
+                current_subgoal = detection_goal
+                _sync_goal_marker(env, current_subgoal, pos)
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = _unwrap_step(env.step(action))
+                last_info = info or {}
+                if last_info.get("goal_reached"):
+                    print("Subgoal waypoint reached. Requesting updated guidance...")
+                episode_reward += reward
+                steps += 1
+                steps_since_llm += 1
+                time.sleep(0.01 if env.gui else 0.0)
+                continue
 
         need_refresh = (
             current_subgoal is None
@@ -200,13 +375,33 @@ def run_episode(
             _sync_goal_marker(env, current_subgoal, pos)
 
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, _ = _unwrap_step(env.step(action))
+        obs, reward, terminated, truncated, info = _unwrap_step(env.step(action))
+        last_info = info or {}
+        if last_info.get("goal_reached"):
+            print("Subgoal waypoint reached. Requesting updated guidance...")
         episode_reward += reward
         steps += 1
         steps_since_llm += 1
         time.sleep(0.01 if env.gui else 0.0)
 
-    status = "SUCCESS" if terminated and not truncated else "TIMEOUT"
+    if max_steps_limit is not None and steps >= max_steps_limit and not terminated and not truncated:
+        step_limit_reached = True
+
+    if step_limit_reached:
+        status = "STEP_LIMIT"
+    elif truncated:
+        status = "TIMEOUT"
+    elif terminated:
+        if last_info.get("collision"):
+            status = "COLLISION"
+        elif last_info.get("human_found"):
+            status = "HUMAN_FOUND"
+        elif last_info.get("goal_reached"):
+            status = "GOAL_REACHED"
+        else:
+            status = "SUCCESS"
+    else:
+        status = "RUNNING"
     print(f"Episode {episode_idx} -> Reward {episode_reward:.2f}, Steps {steps}, Status {status}")
     return EpisodeSummary(
         reward=episode_reward,
@@ -214,6 +409,7 @@ def run_episode(
         status=status,
         llm_calls=llm_calls,
         heuristic_calls=heuristic_calls,
+        path_trace=coverage_tracker.path_trace,
     )
 
 
@@ -272,6 +468,10 @@ def main() -> None:
         print(f"LLM decisions    : {llm_calls}")
         print(f"Heuristic backup : {heur_calls}")
         print("Statuses         : " + ", ".join(s.status for s in summaries))
+        for idx, summary in enumerate(summaries, start=1):
+            print(f"\nFlight path (episode {idx}):")
+            for waypoint in summary.path_trace:
+                print(f"  {waypoint}")
         print("=" * 72)
 
 

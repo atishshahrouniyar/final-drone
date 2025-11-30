@@ -36,6 +36,8 @@ PROXIMITY_THRESHOLD = 0.1
 PROXIMITY_PENALTY = -0.5
 COLLISION_PENALTY = -15.0
 SUCCESS_REWARD = 20.0
+HUMAN_FOUND_REWARD = SUCCESS_REWARD
+HUMAN_DETECTION_RADIUS = 0.6
 RUNS_ROOT = "./runs"
 CHECKPOINT_MILESTONES = [500_000]
 EVAL_FREQUENCY = 50_000
@@ -197,8 +199,9 @@ class RandomPointNavEnv(gym.Env):
         reward = 0.0
 
         # Progress reward
-        if self.prev_dist is not None:
-            reward += self.prev_dist - dist_to_goal
+        prev_dist = self.prev_dist
+        if prev_dist is not None:
+            reward += prev_dist - dist_to_goal
         self.prev_dist = dist_to_goal
 
         # Proximity penalty
@@ -206,16 +209,32 @@ class RandomPointNavEnv(gym.Env):
 
         terminated = False
         truncated = False
+        info = {"collision": False, "goal_reached": False, "human_found": False}
 
         # Collision penalty
         if p.getContactPoints(bodyA=self.drone_id, physicsClientId=self.client):
             reward += COLLISION_PENALTY
             terminated = True
+            info["collision"] = True
 
-        # Success reward
-        if dist_to_goal < SUCCESS_THRESHOLD:
+        # Human detection (considered mission success)
+        if not info["collision"] and getattr(self.scene, "human_positions", None):
+            for human_pos in self.scene.human_positions:
+                if np.linalg.norm(new_pos[:2] - np.array(human_pos[:2])) < HUMAN_DETECTION_RADIUS:
+                    reward += HUMAN_FOUND_REWARD
+                    terminated = True
+                    info["human_found"] = True
+                    break
+
+        # Success reward (goal marker) - no termination, just flag crossing
+        if (
+            not info["collision"]
+            and not info["human_found"]
+            and dist_to_goal < SUCCESS_THRESHOLD
+            and (prev_dist is None or prev_dist >= SUCCESS_THRESHOLD)
+        ):
             reward += SUCCESS_REWARD
-            terminated = True
+            info["goal_reached"] = True
 
         obs = np.concatenate(
             [lidar, np.array([min(dist_to_goal / GOAL_MAX_DIST, 1.0),
@@ -223,7 +242,6 @@ class RandomPointNavEnv(gym.Env):
                                            self.goal_pos[0] - new_pos[0]) - yaw + math.pi) % (2 * math.pi) - math.pi)],
                              dtype=np.float32)]
         )
-        info = {}
         return obs, reward, terminated, truncated, info
 
     # ---------------------------------------------------------------- utilities
