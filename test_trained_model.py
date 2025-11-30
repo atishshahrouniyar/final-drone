@@ -150,7 +150,7 @@ def test_model(
 
 
 if __name__ == "__main__":
-    model_path = sys.argv[1] if len(sys.argv) > 1 else "download/runs/20251128_143337/checkpoints/best_model.zip"
+    model_path = sys.argv[1] if len(sys.argv) > 1 else "download/runs/20251128_143337/dqn_random_point_nav_20251128_143337.zip"
     num_eps = int(sys.argv[2]) if len(sys.argv) > 2 else 20
     max_steps = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
 
