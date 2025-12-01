@@ -223,7 +223,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run DQN policy with Gemini-guided waypoints.")
     parser.add_argument(
         "--model-path",
-        default="runs/20251130_165117/checkpoints/best_model.zip",
+        default="runs/20251130_165117/checkpoints/dqn_random_point_nav_500k.zip",
         help="Path to the trained DQN model (.zip).",
     )
     parser.add_argument("--episodes", type=int, default=1, help="Number of evaluation episodes.")

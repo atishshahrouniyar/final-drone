@@ -156,7 +156,7 @@ def test_model(
 
 if __name__ == "__main__":
     # Default to latest best model from training
-    model_path = sys.argv[1] if len(sys.argv) > 1 else "runs/20251130_172849/checkpoints/best_model.zip"
+    model_path = sys.argv[1] if len(sys.argv) > 1 else "runs/20251130_165117/checkpoints/best_model.zip"
     num_eps = int(sys.argv[2]) if len(sys.argv) > 2 else 5
     max_steps = int(sys.argv[3]) if len(sys.argv) > 3 else 2000  # Match training limit
 
