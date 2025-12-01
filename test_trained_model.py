@@ -5,9 +5,9 @@ Visualize the trained random-point navigation policy with PyBullet GUI.
 Usage:
     python test_trained_model.py [model_path] [num_episodes] [max_steps]
 Defaults:
-    model_path      = "dqn_random_point_nav"
+    model_path      = "runs/20251130_172849/checkpoints/best_model.zip"
     num_episodes    = 5
-    max_steps       = 400
+    max_steps       = 2000
 """
 
 import sys
@@ -17,6 +17,7 @@ from typing import Tuple
 import numpy as np
 import pybullet as p
 from stable_baselines3 import DQN
+from gymnasium.wrappers import TimeLimit
 
 from train_dqn import RandomPointNavEnv
 
@@ -76,19 +77,23 @@ def test_model(
 
     print("\nCreating GUI environment...")
     env = RandomPointNavEnv(gui=True)
+    env = TimeLimit(env, max_episode_steps=2000)  # Match training setup
     episode_rewards = []
     episode_lengths = []
+    
+    # Get reference to the base environment for accessing scene
+    base_env = env.unwrapped
 
     try:
         for episode in range(1, num_episodes + 1):
             obs = _unwrap_reset(env.reset())
 
-            start = getattr(env, "start_pos", None)
-            goal = getattr(env, "goal_pos", None)
+            start = getattr(base_env, "start_pos", None)
+            goal = getattr(base_env, "goal_pos", None)
             if start is not None and goal is not None:
                 print(f"Start: ({start[0]:.2f}, {start[1]:.2f})  ->  Goal: ({goal[0]:.2f}, {goal[1]:.2f})")
-            if hasattr(env.scene, "_update_camera"):
-                env.scene._update_camera()
+            if hasattr(base_env.scene, "_update_camera"):
+                base_env.scene._update_camera()
 
             ep_reward = 0.0
             steps = 0
@@ -101,20 +106,20 @@ def test_model(
                 action, _ = model.predict(obs, deterministic=True)
                 obs, reward, terminated, truncated, info = _unwrap_step(env.step(action))
 
-                if hasattr(env.scene, "_update_camera"):
-                    env.scene._update_camera()
-                if hasattr(env.scene, "client") and env.scene.client is not None:
+                if hasattr(base_env.scene, "_update_camera"):
+                    base_env.scene._update_camera()
+                if hasattr(base_env.scene, "client") and base_env.scene.client is not None:
                     try:
-                        pos, orn = p.getBasePositionAndOrientation(env.scene.drone_id, physicsClientId=env.scene.client)
+                        pos, orn = p.getBasePositionAndOrientation(base_env.scene.drone_id, physicsClientId=base_env.scene.client)
                         yaw = p.getEulerFromQuaternion(orn)[2]
-                        lidar_hits = env._get_lidar(pos, yaw)
-                        env.scene._render_lidar_overlay(pos, yaw, lidar_hits)
+                        lidar_hits = base_env._get_lidar(pos, yaw)
+                        base_env.scene._render_lidar_overlay(pos, yaw, lidar_hits)
                     except Exception:
                         pass
 
                 camera_frame = None
-                if hasattr(env.scene, "_get_drone_camera_image"):
-                    camera_frame = env.scene._get_drone_camera_image()
+                if hasattr(base_env.scene, "_get_drone_camera_image"):
+                    camera_frame = base_env.scene._get_drone_camera_image()
                 detected, center, pix_count = _detect_human_pixels(camera_frame)
                 if detected and not human_spotted:
                     print(f"  ✓ Human detected through camera at pixels {center} (mask={pix_count})")
@@ -150,9 +155,10 @@ def test_model(
 
 
 if __name__ == "__main__":
-    model_path = sys.argv[1] if len(sys.argv) > 1 else "download/runs/20251128_143337/dqn_random_point_nav_20251128_143337.zip"
-    num_eps = int(sys.argv[2]) if len(sys.argv) > 2 else 20
-    max_steps = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
+    # Default to latest best model from training
+    model_path = sys.argv[1] if len(sys.argv) > 1 else "runs/20251130_172849/checkpoints/best_model.zip"
+    num_eps = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+    max_steps = int(sys.argv[3]) if len(sys.argv) > 3 else 2000  # Match training limit
 
     test_model(model_path=model_path, num_episodes=num_eps, max_steps_per_episode=max_steps)
 

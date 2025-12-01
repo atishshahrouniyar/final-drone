@@ -1,0 +1,30 @@
+{
+  "timestamp": "20251130_172849",
+  "total_timesteps": 2000000,
+  "learning_rate": 0.0002,
+  "buffer_size": 200000,
+  "batch_size": 128,
+  "gamma": 0.99,
+  "target_update_interval": 500,
+  "action_repeat": 4,
+  "arena_radius": 20.0,
+  "collision_penalty": -100.0,
+  "success_reward": 20.0,
+  "proximity_penalty": -1.0,
+  "proximity_threshold": 0.1,
+  "ground_clearance_penalty": -8.0,
+  "min_safe_altitude": 0.6,
+  "eval_frequency": 100000,
+  "eval_episodes": 3,
+  "checkpoint_milestones": [
+    100000,
+    250000,
+    500000,
+    750000,
+    1000000
+  ],
+  "max_episode_steps": 2000,
+  "exploration_fraction": 0.4,
+  "exploration_final_eps": 0.02,
+  "gradient_steps": 2
+}
