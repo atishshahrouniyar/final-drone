@@ -46,6 +46,70 @@ def _distance_2d(a: Sequence[float], b: Sequence[float]) -> float:
     return math.sqrt((float(a[0]) - float(b[0]))**2 + (float(a[1]) - float(b[1]))**2)
 
 
+class StuckDetector:
+    """Detects when the drone is stuck near obstacles and triggers LLM recovery."""
+    
+    def __init__(self, window_size: int = 30, movement_threshold: float = 0.3, 
+                 proximity_threshold: float = 0.5):
+        """
+        Args:
+            window_size: Number of steps to track for stuck detection
+            movement_threshold: Minimum distance moved in window to not be stuck (meters)
+            proximity_threshold: Lidar distance below which we consider "near obstacles" (meters)
+        """
+        self.window_size = window_size
+        self.movement_threshold = movement_threshold
+        self.proximity_threshold = proximity_threshold
+        self.position_history: Deque[Tuple[float, float, float]] = deque(maxlen=window_size)
+        self.last_recovery_step = -100  # Prevent spam recovery calls
+        self.recovery_cooldown = 50  # Steps to wait between recovery attempts
+        
+    def update(self, position: Sequence[float], lidar_hits: np.ndarray, step: int) -> bool:
+        """
+        Update position history and check if drone is stuck.
+        
+        Returns:
+            True if drone is stuck and needs recovery
+        """
+        self.position_history.append((float(position[0]), float(position[1]), float(position[2])))
+        
+        # Need enough history to detect stuck
+        if len(self.position_history) < self.window_size:
+            return False
+        
+        # Check if we're in cooldown period
+        if step - self.last_recovery_step < self.recovery_cooldown:
+            return False
+        
+        # Calculate total movement in the window
+        positions_array = np.array(self.position_history)
+        total_movement = 0.0
+        for i in range(1, len(positions_array)):
+            dist = np.linalg.norm(positions_array[i] - positions_array[i-1])
+            total_movement += dist
+        
+        # Check if we're near obstacles (min lidar reading below threshold)
+        min_lidar_dist = float(np.min(lidar_hits)) * 3.0  # lidar_range = 3.0m
+        near_obstacles = min_lidar_dist < self.proximity_threshold
+        
+        # Drone is stuck if: minimal movement AND near obstacles
+        is_stuck = total_movement < self.movement_threshold and near_obstacles
+        
+        if is_stuck:
+            self.last_recovery_step = step
+            print(f"\n⚠️  STUCK DETECTED!")
+            print(f"   Total movement in last {self.window_size} steps: {total_movement:.3f}m")
+            print(f"   Minimum obstacle distance: {min_lidar_dist:.3f}m")
+            print(f"   Triggering LLM recovery...\n")
+        
+        return is_stuck
+    
+    def reset(self):
+        """Reset the stuck detector for a new episode."""
+        self.position_history.clear()
+        self.last_recovery_step = -100
+
+
 def _sync_goal_marker(env: RandomPointNavEnv, goal: Sequence[float], current_pos: Sequence[float]) -> None:
     env.goal_pos = np.array(goal, dtype=np.float32)
     env.prev_dist = float(
@@ -217,6 +281,7 @@ class EpisodeSummary:
     path_trace: List[Tuple[float, float, float]]
     waypoints_reached: int = 0
     detection_attempts: int = 0
+    stuck_recoveries: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -297,6 +362,11 @@ def run_episode(
     last_info: Dict[str, bool] = {}
     planned_queue: Deque[Tuple[List[float], str, int, int]] = deque()
     plan_batch_counter = 1
+    # Increased window and threshold to catch oscillating/circling behavior
+    stuck_detector = StuckDetector(window_size=50, movement_threshold=1.5, proximity_threshold=1.2)
+    stuck_recoveries = 0
+    waypoint_stuck_steps = 0  # Track steps at same waypoint
+    last_waypoint_distance = None
 
     def enqueue_plan(plan_obj: WaypointPlan) -> None:
         nonlocal plan_batch_counter, llm_calls, heuristic_calls, planned_queue
@@ -364,6 +434,132 @@ def run_episode(
                 env.scene._render_lidar_overlay(pos, yaw, lidar_hits)
             except Exception:  # noqa: BLE001
                 pass
+        
+        # Track waypoint progress to detect "stuck at waypoint" situations
+        if current_subgoal is not None:
+            current_dist = _distance_2d(pos, current_subgoal)
+            if last_waypoint_distance is not None:
+                # Check if making progress (getting closer)
+                if abs(current_dist - last_waypoint_distance) < 0.05:  # Not changing distance
+                    waypoint_stuck_steps += 1
+                else:
+                    waypoint_stuck_steps = 0  # Reset if making progress
+            last_waypoint_distance = current_dist
+            
+            # Detect waypoint stuck: not making progress for 200 steps
+            if waypoint_stuck_steps > 200:
+                stuck_waypoint = list(current_subgoal)  # Save before clearing
+                
+                print(f"\n⚠️  WAYPOINT STUCK DETECTED!")
+                print(f"   Stuck at waypoint for {waypoint_stuck_steps} steps")
+                print(f"   Distance to waypoint: {current_dist:.3f}m (not changing)")
+                print(f"   Triggering LLM recovery...\n")
+                
+                stuck_recoveries += 1
+                waypoint_stuck_steps = 0
+                last_waypoint_distance = None
+                planned_queue.clear()
+                current_subgoal = None
+                
+                # Build waypoint stuck recovery context
+                stuck_context = (
+                    f"RECOVERY MODE: Drone unable to reach waypoint at {[round(v,2) for v in stuck_waypoint]}. "
+                    f"Stuck circling/oscillating around {current_dist:.2f}m away. "
+                    f"Minimum obstacle clearance: {float(np.min(lidar_hits)) * 3.0:.2f}m. "
+                    f"Need alternative safe waypoints to bypass obstacle and continue search. "
+                    f"{coverage_summary}"
+                )
+                
+                try:
+                    recovery_plan = commander.get_waypoint_plan(
+                        lidar_hits,
+                        pos,
+                        stuck_context,
+                        max_points=plan_waypoints,
+                        allow_llm=True,
+                    )
+                    print(f"🔧 LLM WAYPOINT RECOVERY PLAN RECEIVED")
+                    enqueue_plan(recovery_plan)
+                except RuntimeError as e:
+                    print(f"LLM recovery failed: {e}. Skipping current waypoint...")
+                    # Skip to next waypoint in queue
+                    if planned_queue:
+                        waypoint, label, idx, total = planned_queue.popleft()
+                        current_subgoal = waypoint
+                        print(f"[Skip] Moving to next waypoint {idx}/{total}: {[round(v, 2) for v in current_subgoal]}")
+                        _sync_goal_marker(env, current_subgoal, pos)
+        else:
+            waypoint_stuck_steps = 0
+            last_waypoint_distance = None
+        
+        # Check if drone is stuck near obstacles (original detector)
+        if stuck_detector.update(pos, lidar_hits, steps):
+            stuck_recoveries += 1
+            # Clear current plan and request new waypoints from LLM
+            planned_queue.clear()
+            current_subgoal = None
+            waypoint_stuck_steps = 0
+            last_waypoint_distance = None
+            
+            # Build stuck recovery context
+            stuck_context = (
+                f"RECOVERY MODE: Drone stuck near obstacles. "
+                f"Minimum clearance: {float(np.min(lidar_hits)) * 3.0:.2f}m. "
+                f"Need safe waypoints to escape current position and continue search. "
+                f"{coverage_summary}"
+            )
+            
+            try:
+                recovery_plan = commander.get_waypoint_plan(
+                    lidar_hits,
+                    pos,
+                    stuck_context,
+                    max_points=plan_waypoints,
+                    allow_llm=True,
+                )
+                print(f"🔧 LLM RECOVERY PLAN RECEIVED")
+                enqueue_plan(recovery_plan)
+            except RuntimeError as e:
+                print(f"LLM recovery failed: {e}. Generating escape waypoint...")
+                # Emergency escape: move away from nearest obstacle
+                obstacle_angles = []
+                for i in range(len(lidar_hits)):
+                    if lidar_hits[i] < 0.5:  # Near obstacle
+                        angle = yaw + i * (2 * math.pi / len(lidar_hits))
+                        obstacle_angles.append(angle)
+                
+                # Find direction with most clearance
+                best_angle = yaw
+                max_clearance = 0.0
+                for test_angle in np.linspace(0, 2*math.pi, 36):
+                    test_angle = (yaw + test_angle) % (2*math.pi)
+                    # Find min distance to any obstacle in this direction
+                    min_dist_to_obstacles = float('inf')
+                    for obs_angle in obstacle_angles:
+                        angle_diff = abs(((test_angle - obs_angle + math.pi) % (2*math.pi)) - math.pi)
+                        if angle_diff < math.pi / 6:  # 30 degree cone
+                            min_dist_to_obstacles = min(min_dist_to_obstacles, float(np.min(lidar_hits)) * 3.0)
+                    if min_dist_to_obstacles > max_clearance:
+                        max_clearance = min_dist_to_obstacles
+                        best_angle = test_angle
+                
+                # Generate escape waypoint
+                escape_distance = 3.0  # Move 3m away
+                escape_wp = [
+                    float(pos[0]) + escape_distance * math.cos(best_angle),
+                    float(pos[1]) + escape_distance * math.sin(best_angle),
+                    1.5
+                ]
+                # Clamp to arena
+                r = math.sqrt(escape_wp[0]**2 + escape_wp[1]**2)
+                if r > 18.0:
+                    factor = 18.0 / max(r, 1e-6)
+                    escape_wp[0] *= factor
+                    escape_wp[1] *= factor
+                
+                planned_queue.append((escape_wp, "ESCAPE", 1, 1))
+                print(f"   Emergency escape waypoint: {[round(v, 2) for v in escape_wp]}")
+        
         coverage_summary = coverage_tracker.summary()
         sensor_report = (
             last_detection_report
@@ -500,7 +696,8 @@ def run_episode(
             status = "SUCCESS"
     else:
         status = "RUNNING"
-    print(f"Episode {episode_idx} -> Reward {episode_reward:.2f}, Steps {steps}, Status {status}")
+    print(f"Episode {episode_idx} -> Reward {episode_reward:.2f}, Steps {steps}, Status {status}, "
+          f"Waypoints {waypoints_reached}, Stuck Recoveries {stuck_recoveries}")
     return EpisodeSummary(
         reward=episode_reward,
         steps=steps,
@@ -510,6 +707,7 @@ def run_episode(
         path_trace=coverage_tracker.path_trace,
         waypoints_reached=waypoints_reached,
         detection_attempts=detection_attempts,
+        stuck_recoveries=stuck_recoveries,
     )
 
 
@@ -572,6 +770,8 @@ def main() -> None:
         print(f"Heuristic backup : {heur_calls}")
         print(f"Waypoints reached: {total_waypoints} (avg {total_waypoints/max(len(summaries),1):.1f} per episode)")
         print(f"Visual detections: {total_detections}")
+        total_recoveries = sum(s.stuck_recoveries for s in summaries)
+        print(f"Stuck recoveries : {total_recoveries} (avg {total_recoveries/max(len(summaries),1):.1f} per episode)")
         print("Statuses         : " + ", ".join(s.status for s in summaries))
         
         # Success rate tracking
