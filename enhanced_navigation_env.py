@@ -160,10 +160,10 @@ class EnhancedForestWithObstacles:
         # Initial camera setup
         self._update_camera()
         self._lidar_indicator = {"handles": [], "update_every": 1, "last_update": 0}
-    def reposition_humans(self):
+    def reposition_humans(self, target_sector: str = None):
         """Randomize human locations (called each episode)."""
-        if not self.human_ids:
-            self._place_humans()
+        if not self.human_ids or target_sector:
+            self._place_humans(target_sector)
             return
         for idx, human_id in enumerate(self.human_ids):
             pos = self._sample_human_spot()
@@ -173,14 +173,31 @@ class EnhancedForestWithObstacles:
             )
             self._update_human_label(idx, pos)
 
-    def _place_humans(self):
-        """Spawn bright capsules representing humans."""
+    def _place_humans(self, target_sector: str = None):
+        """
+        Spawn bright capsules representing humans.
+        If target_sector is provided (e.g. "NE", "SW"), force humans into that quadrant.
+        """
         self._clear_human_labels()
         self.human_ids = []
         self.human_positions = []
         self.human_label_ids = []
-        for i in range(NUM_HUMANS):
-            pos = self._sample_human_spot()
+        
+        # Determine angle range based on sector
+        angle_range = None
+        if target_sector:
+            if target_sector.upper() == "NE":
+                angle_range = (0, math.pi/2)
+            elif target_sector.upper() == "NW":
+                angle_range = (math.pi/2, math.pi)
+            elif target_sector.upper() == "SW":
+                angle_range = (math.pi, 3*math.pi/2)
+            elif target_sector.upper() == "SE":
+                angle_range = (3*math.pi/2, 2*math.pi)
+        
+        count = 1 if target_sector else NUM_HUMANS
+        for i in range(count):
+            pos = self._sample_human_spot(angle_range)
             if pos is None:
                 continue
             human_id = self._create_human_body(pos, HUMAN_COLOR)
@@ -189,9 +206,15 @@ class EnhancedForestWithObstacles:
                 self.human_positions.append(pos)
                 self.human_label_ids.append(self._create_human_label(pos))
 
-    def _sample_human_spot(self):
+    def _sample_human_spot(self, angle_range=None):
         for _ in range(60):
-            x, y = rand_in_disk(self.radius * 0.85)
+            r = math.sqrt(random.random()) * (self.radius * 0.85)
+            if angle_range:
+                theta = random.uniform(angle_range[0], angle_range[1])
+            else:
+                theta = random.random() * 2 * math.pi
+            x = r * math.cos(theta)
+            y = r * math.sin(theta)
             if self._valid(x, y, min_sep=0.8):
                 return [x, y, HUMAN_HEIGHT / 2.0]
         return None

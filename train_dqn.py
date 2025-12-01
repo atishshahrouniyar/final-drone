@@ -3,6 +3,8 @@ Train a DQN agent to move a drone between two random points
 inside a 40x40 PyBullet environment while avoiding obstacles.
 """
 
+import csv
+import json
 import math
 import os
 from datetime import datetime
@@ -33,35 +35,86 @@ GOAL_MIN_DIST = 3.0
 GOAL_MAX_DIST = 5.0
 SUCCESS_THRESHOLD = 0.3
 PROXIMITY_THRESHOLD = 0.1
-PROXIMITY_PENALTY = -0.5
-COLLISION_PENALTY = -40.0
+PROXIMITY_PENALTY = -1.0  # Increased from -0.5 for stronger obstacle avoidance
+COLLISION_PENALTY = -100.0  # Increased from -40.0 for much harsher penalty
 SUCCESS_REWARD = 20.0
 HUMAN_FOUND_REWARD = SUCCESS_REWARD
 HUMAN_DETECTION_RADIUS = 0.6
 MIN_SAFE_ALTITUDE = 0.6
 GROUND_CLEARANCE_PENALTY = -8.0
 RUNS_ROOT = "./runs"
-CHECKPOINT_MILESTONES = [500_000]
-EVAL_FREQUENCY = 50_000
-EVAL_EPISODES = 5
+CHECKPOINT_MILESTONES = [100_000, 250_000, 500_000, 750_000, 1_000_000]  # More frequent checkpoints
+EVAL_FREQUENCY = 100_000  # Reduced from 50_000 (evaluate less often)
+EVAL_EPISODES = 3  # Reduced from 5 (faster evaluation)
 
 import gymnasium as gym
 from gymnasium import spaces
+from gymnasium.wrappers import TimeLimit
 
 
 class TrainingLogger(BaseCallback):
-    """Lightweight logger for monitoring learning speed."""
+    """Comprehensive logger for monitoring learning and collecting metrics."""
 
-    def __init__(self, check_freq: int = 5000):
+    def __init__(self, check_freq: int = 5000, log_dir: str = "./logs"):
         super().__init__()
         self.check_freq = check_freq
+        self.log_dir = log_dir
         self.start_time = time.time()
+        self.csv_path = os.path.join(log_dir, "training_metrics.csv")
+        
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Initialize CSV file with headers
+        with open(self.csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestep', 'episode', 'fps', 'elapsed_time',
+                'ep_len_mean', 'ep_rew_mean', 
+                'train/loss', 'train/learning_rate',
+                'train/n_updates', 'rollout/exploration_rate',
+                'time/total_timesteps'
+            ])
 
     def _on_step(self) -> bool:
         if self.n_calls % self.check_freq == 0:
             elapsed = max(time.time() - self.start_time, 1e-6)
             fps = self.num_timesteps / elapsed
+            
+            # Log to tensorboard
             self.logger.record("custom/fps", fps)
+            self.logger.record("custom/elapsed_time", elapsed)
+            
+            # Collect metrics from logger
+            metrics = {
+                'timestep': self.num_timesteps,
+                'episode': self.locals.get('episode_num', 0),
+                'fps': fps,
+                'elapsed_time': elapsed,
+                'ep_len_mean': self.locals.get('ep_len_mean', 0),
+                'ep_rew_mean': self.locals.get('ep_rew_mean', 0),
+                'train/loss': self.model.logger.name_to_value.get('train/loss', 0),
+                'train/learning_rate': self.model.logger.name_to_value.get('train/learning_rate', 0),
+                'train/n_updates': self.model.logger.name_to_value.get('train/n_updates', 0),
+                'rollout/exploration_rate': self.model.logger.name_to_value.get('rollout/exploration_rate', 0),
+                'time/total_timesteps': self.num_timesteps,
+            }
+            
+            # Save to CSV
+            with open(self.csv_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    metrics['timestep'], metrics['episode'], metrics['fps'], 
+                    metrics['elapsed_time'], metrics['ep_len_mean'], metrics['ep_rew_mean'],
+                    metrics['train/loss'], metrics['train/learning_rate'], 
+                    metrics['train/n_updates'], metrics['rollout/exploration_rate'],
+                    metrics['time/total_timesteps']
+                ])
+            
+            # Print progress
+            print(f"\n[Training Progress] Timestep: {self.num_timesteps:,} | "
+                  f"FPS: {fps:.1f} | Reward: {metrics['ep_rew_mean']:.2f} | "
+                  f"Loss: {metrics['train/loss']:.4f}")
+        
         return True
 
 
@@ -85,6 +138,83 @@ class MilestoneCheckpoint(BaseCallback):
                 self.model.save(path)
                 print(f"[Checkpoint] Saved model at {milestone:,} steps -> {path}.zip")
                 self.saved.add(milestone)
+        return True
+
+
+class DetailedMetricsCallback(BaseCallback):
+    """Collect detailed training metrics including Q-values, TD error, etc."""
+    
+    def __init__(self, log_freq: int = 1000, log_dir: str = "./logs"):
+        super().__init__()
+        self.log_freq = log_freq
+        self.log_dir = log_dir
+        self.metrics_path = os.path.join(log_dir, "detailed_metrics.csv")
+        
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Initialize CSV
+        with open(self.metrics_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestep', 'q_value_mean', 'q_value_std', 'q_value_max', 'q_value_min',
+                'td_error_mean', 'td_error_std', 'buffer_size', 'exploration_rate',
+                'learning_rate', 'loss'
+            ])
+    
+    def _on_step(self) -> bool:
+        if self.n_calls % self.log_freq == 0:
+            try:
+                # Access DQN internals
+                replay_buffer = self.model.replay_buffer
+                
+                # Sample batch to compute Q-value statistics
+                if replay_buffer.size() > self.model.batch_size:
+                    replay_data = replay_buffer.sample(self.model.batch_size)
+                    
+                    with self.model.policy.q_net.eval():
+                        q_values = self.model.policy.q_net(replay_data.observations)
+                        q_value_mean = float(q_values.mean().detach().cpu().numpy())
+                        q_value_std = float(q_values.std().detach().cpu().numpy())
+                        q_value_max = float(q_values.max().detach().cpu().numpy())
+                        q_value_min = float(q_values.min().detach().cpu().numpy())
+                    
+                    # Compute TD errors
+                    with self.model.policy.q_net_target.eval():
+                        next_q_values = self.model.policy.q_net_target(replay_data.next_observations)
+                        max_next_q_values = next_q_values.max(dim=1)[0]
+                        target_q_values = replay_data.rewards.flatten() + (1 - replay_data.dones.flatten()) * self.model.gamma * max_next_q_values
+                        
+                        current_q_values = q_values.gather(1, replay_data.actions.long()).squeeze()
+                        td_errors = (target_q_values - current_q_values).detach().cpu().numpy()
+                        td_error_mean = float(np.mean(np.abs(td_errors)))
+                        td_error_std = float(np.std(td_errors))
+                else:
+                    q_value_mean = q_value_std = q_value_max = q_value_min = 0.0
+                    td_error_mean = td_error_std = 0.0
+                
+                buffer_size = replay_buffer.size()
+                exploration_rate = self.model.exploration_rate
+                learning_rate = self.model.learning_rate
+                loss = self.model.logger.name_to_value.get('train/loss', 0.0)
+                
+                # Log to tensorboard
+                self.logger.record("metrics/q_value_mean", q_value_mean)
+                self.logger.record("metrics/q_value_std", q_value_std)
+                self.logger.record("metrics/td_error_mean", td_error_mean)
+                self.logger.record("metrics/buffer_size", buffer_size)
+                
+                # Save to CSV
+                with open(self.metrics_path, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        self.num_timesteps, q_value_mean, q_value_std, 
+                        q_value_max, q_value_min, td_error_mean, td_error_std,
+                        buffer_size, exploration_rate, learning_rate, loss
+                    ])
+                    
+            except Exception as e:
+                print(f"[DetailedMetrics] Warning: Could not collect metrics: {e}")
+        
         return True
 
 
@@ -162,10 +292,21 @@ class RandomPointNavEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self._rng = np.random.default_rng(int(self.np_random.integers(1 << 63)))
-        if hasattr(self.scene, "reposition_humans"):
-            self.scene.reposition_humans()
+        
+        # Extract target sector from options if present
+        target_sector = None
+        if options and "target_sector" in options:
+            target_sector = options["target_sector"]
 
-        sx, sy = self._sample_valid_point()
+        if hasattr(self.scene, "reposition_humans"):
+            self.scene.reposition_humans(target_sector)
+
+        # Force start at (0,0) if requested (for search missions)
+        if options and options.get("center_start"):
+            sx, sy = 0.0, 0.0
+        else:
+            sx, sy = self._sample_valid_point()
+            
         start = np.array([sx, sy, 1.0], dtype=np.float32)
         self.start_pos = start.copy()
         self.goal_pos = self._sample_goal(start[:2])
@@ -195,6 +336,17 @@ class RandomPointNavEnv(gym.Env):
 
         new_pos, _ = p.getBasePositionAndOrientation(self.drone_id, physicsClientId=self.client)
         new_pos = np.array(new_pos)
+        
+        # Force altitude to 1.5m to match deployment behavior (with small tolerance)
+        if abs(new_pos[2] - 1.5) > 0.2:
+            p.resetBasePositionAndOrientation(
+                self.drone_id, 
+                [new_pos[0], new_pos[1], 1.5], 
+                [0, 0, 0, 1], 
+                physicsClientId=self.client
+            )
+            new_pos[2] = 1.5
+        
         dist_to_goal = np.linalg.norm(self.goal_pos[:2] - new_pos[:2])
 
         lidar = self._get_lidar(new_pos, yaw)
@@ -208,6 +360,12 @@ class RandomPointNavEnv(gym.Env):
 
         # Proximity penalty
         reward += self._proximity_penalty(lidar)
+        
+        # Bonus for maintaining safe distance from obstacles (encourage collision-free flying)
+        min_norm = float(np.min(lidar))
+        min_lidar_dist = min_norm * self.lidar_range
+        if min_lidar_dist > 1.0:  # Safe distance maintained
+            reward += 0.1  # Small bonus for safe flying
 
         # Strongly discourage skimming the ground (common failure mode)
         if new_pos[2] < MIN_SAFE_ALTITUDE:
@@ -250,8 +408,8 @@ class RandomPointNavEnv(gym.Env):
 
         obs = np.concatenate(
             [lidar, np.array([min(dist_to_goal / GOAL_MAX_DIST, 1.0),
-                              ((math.atan2(self.goal_pos[1] - new_pos[1],
-                                           self.goal_pos[0] - new_pos[0]) - yaw + math.pi) % (2 * math.pi) - math.pi)],
+                              (((math.atan2(self.goal_pos[1] - new_pos[1],
+                                           self.goal_pos[0] - new_pos[0]) - yaw + math.pi) % (2 * math.pi) - math.pi) / math.pi)],
                              dtype=np.float32)]
         )
         return obs, reward, terminated, truncated, info
@@ -288,7 +446,8 @@ class RandomPointNavEnv(gym.Env):
         dist = np.linalg.norm(self.goal_pos[:2] - np.array(pos[:2]))
         rel_angle = (math.atan2(self.goal_pos[1] - pos[1], self.goal_pos[0] - pos[0]) - yaw + math.pi) % (2 * math.pi) - math.pi
         goal_dist_norm = min(dist / GOAL_MAX_DIST, 1.0)
-        return np.concatenate([lidar, np.array([goal_dist_norm, rel_angle], dtype=np.float32)])
+        rel_angle_norm = rel_angle / math.pi  # Normalize to [-1, 1]
+        return np.concatenate([lidar, np.array([goal_dist_norm, rel_angle_norm], dtype=np.float32)])
 
     def close(self):
         try:
@@ -303,15 +462,56 @@ def train():
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
     tensorboard_dir = os.path.join(run_dir, "tensorboard")
     eval_log_dir = os.path.join(run_dir, "eval_logs")
+    metrics_dir = os.path.join(run_dir, "metrics")
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(tensorboard_dir, exist_ok=True)
     os.makedirs(eval_log_dir, exist_ok=True)
+    os.makedirs(metrics_dir, exist_ok=True)
+    
+    # Save training configuration metadata
+    config = {
+        'timestamp': timestamp,
+        'total_timesteps': TOTAL_TIMESTEPS,
+        'learning_rate': LEARNING_RATE,
+        'buffer_size': BUFFER_SIZE,
+        'batch_size': BATCH_SIZE,
+        'gamma': GAMMA,
+        'target_update_interval': TARGET_UPDATE_INTERVAL,
+        'action_repeat': ACTION_REPEAT,
+        'arena_radius': ARENA_RADIUS,
+        'collision_penalty': COLLISION_PENALTY,
+        'success_reward': SUCCESS_REWARD,
+        'proximity_penalty': PROXIMITY_PENALTY,
+        'proximity_threshold': PROXIMITY_THRESHOLD,
+        'ground_clearance_penalty': GROUND_CLEARANCE_PENALTY,
+        'min_safe_altitude': MIN_SAFE_ALTITUDE,
+        'eval_frequency': EVAL_FREQUENCY,
+        'eval_episodes': EVAL_EPISODES,
+        'checkpoint_milestones': CHECKPOINT_MILESTONES,
+        'max_episode_steps': 2000,
+        'exploration_fraction': 0.4,
+        'exploration_final_eps': 0.02,
+        'gradient_steps': 2,
+    }
+    
+    with open(os.path.join(run_dir, 'training_config.json'), 'w') as f:
+        json.dump(config, f, indent=2)
+    print(f"\n{'='*70}")
+    print(f"Training Configuration Saved: {run_dir}/training_config.json")
+    print(f"{'='*70}\n")
 
-    env = Monitor(RandomPointNavEnv(gui=False))
-    eval_env = Monitor(RandomPointNavEnv(gui=False))
+    env = RandomPointNavEnv(gui=False)
+    env = TimeLimit(env, max_episode_steps=2000)  # Prevent infinite episodes
+    env = Monitor(env)
+    
+    eval_env = RandomPointNavEnv(gui=False)
+    eval_env = TimeLimit(eval_env, max_episode_steps=2000)
+    eval_env = Monitor(eval_env)
 
     checkpoint_cb = MilestoneCheckpoint(CHECKPOINT_MILESTONES, checkpoint_dir)
+    training_logger_cb = TrainingLogger(check_freq=5000, log_dir=metrics_dir)
+    detailed_metrics_cb = DetailedMetricsCallback(log_freq=1000, log_dir=metrics_dir)
     eval_cb = EvalCallback(
         eval_env,
         best_model_save_path=checkpoint_dir,
@@ -319,8 +519,9 @@ def train():
         eval_freq=EVAL_FREQUENCY,
         n_eval_episodes=EVAL_EPISODES,
         deterministic=True,
+        verbose=1,
     )
-    callback = CallbackList([TrainingLogger(), checkpoint_cb, eval_cb])
+    callback = CallbackList([training_logger_cb, detailed_metrics_cb, checkpoint_cb, eval_cb])
 
     model = DQN(
         "MlpPolicy",
@@ -331,21 +532,50 @@ def train():
         batch_size=BATCH_SIZE,
         gamma=GAMMA,
         target_update_interval=TARGET_UPDATE_INTERVAL,
-        exploration_fraction=0.3,
-        exploration_final_eps=0.05,
+        exploration_fraction=0.4,  # Increased from 0.3 (explore longer)
+        exploration_final_eps=0.02,  # Decreased from 0.05 (more exploitation)
         train_freq=4,
-        gradient_steps=1,
+        gradient_steps=2,  # Increased from 1 (more learning per step)
         verbose=1,
         tensorboard_log=tensorboard_dir,
         device="auto",
     )
 
     try:
+        print(f"\n{'='*70}")
+        print(f"Starting Training: {TOTAL_TIMESTEPS:,} timesteps")
+        print(f"Logs: {run_dir}")
+        print(f"{'='*70}\n")
+        
+        training_start = time.time()
         model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callback)
+        training_duration = time.time() - training_start
+        
+        # Save final training summary
+        summary = {
+            'training_completed': True,
+            'total_timesteps': TOTAL_TIMESTEPS,
+            'training_duration_seconds': training_duration,
+            'training_duration_hours': training_duration / 3600,
+            'final_exploration_rate': float(model.exploration_rate),
+            'buffer_size_final': model.replay_buffer.size(),
+            'timestamp_end': datetime.now().strftime("%Y%m%d_%H%M%S"),
+        }
+        
+        with open(os.path.join(run_dir, 'training_summary.json'), 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        print(f"\n{'='*70}")
+        print(f"Training Complete!")
+        print(f"Duration: {training_duration/3600:.2f} hours")
+        print(f"Final exploration rate: {model.exploration_rate:.4f}")
+        print(f"Summary saved: {run_dir}/training_summary.json")
+        print(f"{'='*70}\n")
+        
     finally:
         model_path = os.path.join(run_dir, f"dqn_random_point_nav_{timestamp}")
         model.save(model_path)
-        print(f"Saved model to {model_path}.zip")
+        print(f"Saved final model to {model_path}.zip")
         env.close()
         eval_env.close()
 

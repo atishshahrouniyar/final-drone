@@ -14,13 +14,14 @@ import argparse
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from collections import deque
+from typing import Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pybullet as p
 from stable_baselines3 import DQN
 
-from mission_commander import LLMDecision, MissionCommanderLLM
+from mission_commander import LLMDecision, MissionCommanderLLM, WaypointPlan
 from train_dqn import RandomPointNavEnv
 
 
@@ -36,7 +37,13 @@ def _unwrap_step(result):
 
 
 def _distance(a: Sequence[float], b: Sequence[float]) -> float:
+    """3D Euclidean distance."""
     return math.dist((float(a[0]), float(a[1]), float(a[2])), (float(b[0]), float(b[1]), float(b[2])))
+
+
+def _distance_2d(a: Sequence[float], b: Sequence[float]) -> float:
+    """2D horizontal distance, ignoring altitude."""
+    return math.sqrt((float(a[0]) - float(b[0]))**2 + (float(a[1]) - float(b[1]))**2)
 
 
 def _sync_goal_marker(env: RandomPointNavEnv, goal: Sequence[float], current_pos: Sequence[float]) -> None:
@@ -208,13 +215,15 @@ class EpisodeSummary:
     llm_calls: int
     heuristic_calls: int
     path_trace: List[Tuple[float, float, float]]
+    waypoints_reached: int = 0
+    detection_attempts: int = 0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run DQN policy with Gemini-guided waypoints.")
     parser.add_argument(
         "--model-path",
-        default="download/runs/20251128_143337/dqn_random_point_nav_20251128_143337.zip",
+        default="download/runs/20251128_143337/checkpoints/best_model.zip",
         help="Path to the trained DQN model (.zip).",
     )
     parser.add_argument("--episodes", type=int, default=1, help="Number of evaluation episodes.")
@@ -238,8 +247,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mission-story",
-        default="Conduct a methodical search of the forest arena, sweeping each quadrant for survivors.",
+        default="Search North-East quadrant for survivors.",
         help="Natural-language brief that guides the LLM's search strategy.",
+    )
+    parser.add_argument(
+        "--plan-waypoints",
+        type=int,
+        default=20,
+        help="Number of waypoints to request per batch from the planner.",
     )
     return parser.parse_args()
 
@@ -252,16 +267,27 @@ def run_episode(
     max_steps: int,
     llm_interval: int,
     dist_threshold: float,
+    plan_waypoints: int,
 ) -> EpisodeSummary:
-    obs = _unwrap_reset(env.reset())
+    
+    # Determine target sector from story (naive parsing for demo)
+    target_sector = None
+    story_upper = commander.mission_story.upper()
+    if "NORTH-EAST" in story_upper or "NORTHEAST" in story_upper: target_sector = "NE"
+    elif "NORTH-WEST" in story_upper or "NORTHWEST" in story_upper: target_sector = "NW"
+    elif "SOUTH-EAST" in story_upper or "SOUTHEAST" in story_upper: target_sector = "SE"
+    elif "SOUTH-WEST" in story_upper or "SOUTHWEST" in story_upper: target_sector = "SW"
+
+    obs = _unwrap_reset(env.reset(options={"center_start": True, "target_sector": target_sector}))
     episode_reward = 0.0
     steps = 0
     terminated = truncated = False
     current_subgoal: List[float] | None = None
-    steps_since_llm = llm_interval  # force immediate request
 
     llm_calls = 0
     heuristic_calls = 0
+    waypoints_reached = 0
+    detection_attempts = 0
     last_detection_report: str | None = None
     coverage_tracker = SearchCoverageTracker()
     client_id = getattr(env, "client", getattr(env.scene, "client", None))
@@ -269,8 +295,49 @@ def run_episode(
     detection_goal: List[float] | None = None
     detection_markers: List[int] = []
     last_info: Dict[str, bool] = {}
+    planned_queue: Deque[Tuple[List[float], str, int, int]] = deque()
+    plan_batch_counter = 1
+
+    def enqueue_plan(plan_obj: WaypointPlan) -> None:
+        nonlocal plan_batch_counter, llm_calls, heuristic_calls, planned_queue
+        if not plan_obj.waypoints:
+            return
+        label = f"{plan_obj.source.upper()}-{plan_batch_counter}"
+        total = len(plan_obj.waypoints)
+        print("\n============= WAYPOINT PLAN =============")
+        print(f"Label       : {label}")
+        print(f"Source      : {plan_obj.source.upper()}")
+        print(f"Waypoints   : {total}")
+        print(f"Instruction : {plan_obj.instruction}")
+        print(f"Reason      : {plan_obj.reason}")
+        for idx, wp in enumerate(plan_obj.waypoints, start=1):
+            rounded = [round(v, 2) for v in wp]
+            print(f"  - {idx:02d}/{total}: {rounded}")
+        print("=========================================\n")
+        for idx, wp in enumerate(plan_obj.waypoints, start=1):
+            planned_queue.append((list(wp), label, idx, total))
+        if plan_obj.source == "llm":
+            llm_calls += 1
+        # Heuristic tracking removed
+        plan_batch_counter += 1
 
     print(f"\n--- Episode {episode_idx} ---")
+
+    pos0, orn0 = p.getBasePositionAndOrientation(env.drone_id, physicsClientId=env.client)
+    yaw0 = p.getEulerFromQuaternion(orn0)[2]
+    initial_lidar = env._get_lidar(pos0, yaw0)
+    initial_report = "Initial sweep: no detections yet; awaiting plan."
+    try:
+        initial_plan = commander.get_waypoint_plan(
+            initial_lidar,
+            pos0,
+            initial_report,
+            max_points=plan_waypoints,
+            allow_llm=True,
+        )
+        enqueue_plan(initial_plan)
+    except RuntimeError as e:
+        print(f"Initial planning failed: {e}")
 
     max_steps_limit = max_steps if max_steps > 0 else None
     step_limit_reached = False
@@ -312,6 +379,7 @@ def run_episode(
         if camera_frame is not None:
             detected, center, pix_count = _detect_human_pixels(camera_frame)
             if detected:
+                detection_attempts += 1
                 detection_text = (
                     f"Camera spotted a high-visibility target near pixel {center} "
                     f"(mask count {pix_count}). Investigate this bearing."
@@ -328,6 +396,21 @@ def run_episode(
 
         sensor_report = f"{coverage_summary} {sensor_report}"
 
+        # Check if we've reached current planned waypoint (even if chasing detection)
+        if current_subgoal is not None and _distance_2d(pos, current_subgoal) < dist_threshold:
+            print("Planned waypoint reached. Advancing to the next queued target.")
+            waypoints_reached += 1
+            current_subgoal = None
+            # Pop next waypoint if available
+            if planned_queue:
+                waypoint, label, idx, total = planned_queue.popleft()
+                current_subgoal = waypoint
+                print(
+                    f"[WaypointQueue:{label}] Heading to waypoint {idx}/{total}: "
+                    f"{[round(v, 2) for v in current_subgoal]}"
+                )
+                _sync_goal_marker(env, current_subgoal, pos)
+
         if detection_goal is not None:
             if _distance(pos, detection_goal) < 0.5:
                 print("Detection target reached. Scanning area for survivors...")
@@ -335,53 +418,68 @@ def run_episode(
                 _clear_debug_items(client_id, detection_markers)
                 detection_markers = []
             else:
-                current_subgoal = detection_goal
-                _sync_goal_marker(env, current_subgoal, pos)
+                # Override current subgoal temporarily to chase detection
+                temp_goal = detection_goal
+                _sync_goal_marker(env, temp_goal, pos)
                 action, _ = model.predict(obs, deterministic=True)
                 obs, reward, terminated, truncated, info = _unwrap_step(env.step(action))
                 last_info = info or {}
-                if last_info.get("goal_reached"):
-                    print("Subgoal waypoint reached. Requesting updated guidance...")
                 episode_reward += reward
                 steps += 1
-                steps_since_llm += 1
                 time.sleep(0.01 if env.gui else 0.0)
                 continue
 
-        need_refresh = (
-            current_subgoal is None
-            or _distance(pos, current_subgoal) < dist_threshold
-            or steps_since_llm >= llm_interval
-        )
+        # Normal waypoint following (when no detection target)
+        if current_subgoal is None:
+            if not planned_queue:
+                context = f"{coverage_summary} {sensor_report}"
+                # Always allow LLM (heuristic fallback removed)
+                try:
+                    fallback_plan = commander.get_waypoint_plan(
+                            lidar_hits,
+                        pos,
+                        context,
+                        max_points=plan_waypoints,
+                        allow_llm=True,
+                    )
+                    enqueue_plan(fallback_plan)
+                except RuntimeError as e:
+                    print(f"Planner failed: {e}. Using emergency waypoint.")
+                    # Generate a simple forward waypoint as emergency fallback
+                    emergency_wp = [
+                        float(pos[0]) + 2.0 * math.cos(yaw),
+                        float(pos[1]) + 2.0 * math.sin(yaw),
+                        1.5
+                    ]
+                    # Clamp to arena bounds
+                    r = math.sqrt(emergency_wp[0]**2 + emergency_wp[1]**2)
+                    if r > 18.0:  # Stay within safe bounds
+                        factor = 18.0 / max(r, 1e-6)
+                        emergency_wp[0] *= factor
+                        emergency_wp[1] *= factor
+                    planned_queue.append((emergency_wp, "EMERGENCY", 1, 1))
 
-        if need_refresh:
-            decision: LLMDecision = commander.get_subgoal(
-                lidar_hits, pos, sensor_report, steps
-            )
-            current_subgoal = decision.subgoal
-            steps_since_llm = 0
-            if decision.source == "llm":
-                llm_calls += 1
-            else:
-                heuristic_calls += 1
-
-            print("\n============= NAV UPDATE =============")
-            print(f"Source      : {decision.source.upper()}")
-            print(f"Instruction : {decision.instruction}")
-            print(f"Reason      : {decision.reason}")
-            print(f"Subgoal xyz : {[round(v, 2) for v in current_subgoal]}")
-            print("======================================\n")
-
-            _sync_goal_marker(env, current_subgoal, pos)
+            if planned_queue:
+                waypoint, label, idx, total = planned_queue.popleft()
+                current_subgoal = waypoint
+                print(
+                    f"[WaypointQueue:{label}] Heading to waypoint {idx}/{total}: "
+                    f"{[round(v, 2) for v in current_subgoal]}"
+                )
+                _sync_goal_marker(env, current_subgoal, pos)
 
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, terminated, truncated, info = _unwrap_step(env.step(action))
         last_info = info or {}
-        if last_info.get("goal_reached"):
-            print("Subgoal waypoint reached. Requesting updated guidance...")
         episode_reward += reward
         steps += 1
-        steps_since_llm += 1
+        
+        # Periodic status update
+        if llm_interval > 0 and steps % llm_interval == 0 and current_subgoal is not None:
+            dist_to_subgoal = _distance_2d(pos, current_subgoal)
+            print(f"[Step {steps}] Position: [{pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}], "
+                  f"Distance to waypoint: {dist_to_subgoal:.2f}m, Reward: {episode_reward:.1f}")
+        
         time.sleep(0.01 if env.gui else 0.0)
 
     if max_steps_limit is not None and steps >= max_steps_limit and not terminated and not truncated:
@@ -410,6 +508,8 @@ def run_episode(
         llm_calls=llm_calls,
         heuristic_calls=heuristic_calls,
         path_trace=coverage_tracker.path_trace,
+        waypoints_reached=waypoints_reached,
+        detection_attempts=detection_attempts,
     )
 
 
@@ -445,6 +545,7 @@ def main() -> None:
                     max_steps=args.max_steps,
                     llm_interval=args.llm_interval,
                     dist_threshold=args.dist_threshold,
+                    plan_waypoints=args.plan_waypoints,
                 )
             )
     except KeyboardInterrupt:
@@ -457,6 +558,8 @@ def main() -> None:
         lengths = [s.steps for s in summaries]
         llm_calls = sum(s.llm_calls for s in summaries)
         heur_calls = sum(s.heuristic_calls for s in summaries)
+        total_waypoints = sum(s.waypoints_reached for s in summaries)
+        total_detections = sum(s.detection_attempts for s in summaries)
 
         print("\n" + "=" * 72)
         print("Evaluation summary")
@@ -467,11 +570,16 @@ def main() -> None:
         print(f"Best / Worst     : {max(rewards):.2f} / {min(rewards):.2f}")
         print(f"LLM decisions    : {llm_calls}")
         print(f"Heuristic backup : {heur_calls}")
+        print(f"Waypoints reached: {total_waypoints} (avg {total_waypoints/max(len(summaries),1):.1f} per episode)")
+        print(f"Visual detections: {total_detections}")
         print("Statuses         : " + ", ".join(s.status for s in summaries))
-        for idx, summary in enumerate(summaries, start=1):
-            print(f"\nFlight path (episode {idx}):")
-            for waypoint in summary.path_trace:
-                print(f"  {waypoint}")
+        
+        # Success rate tracking
+        success_count = sum(1 for s in summaries if s.status == "HUMAN_FOUND")
+        collision_count = sum(1 for s in summaries if s.status == "COLLISION")
+        print(f"\nSuccess Rate     : {success_count}/{len(summaries)} ({100*success_count/max(len(summaries),1):.1f}%)")
+        print(f"Collision Rate   : {collision_count}/{len(summaries)} ({100*collision_count/max(len(summaries),1):.1f}%)")
+        
         print("=" * 72)
 
 

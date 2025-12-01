@@ -30,6 +30,16 @@ class LLMDecision:
     source: str  # "llm" or "heuristic"
 
 
+@dataclass
+class WaypointPlan:
+    """Batch waypoint plan requested once per episode."""
+
+    waypoints: List[List[float]]
+    instruction: str
+    reason: str
+    source: str  # "llm" or "heuristic"
+
+
 class MissionCommanderLLM:
     """
     Thin wrapper around Google's Gemini API for high-level waypoint planning.
@@ -66,7 +76,15 @@ class MissionCommanderLLM:
         else:
             genai.configure(api_key=token)
             try:
-                self.client = genai.GenerativeModel(self.model_name)
+                # Configure generation settings to prevent truncation
+                generation_config = genai.GenerationConfig(
+                    temperature=self.temperature,
+                    max_output_tokens=2048,  # Increased to accommodate 20 waypoints
+                )
+                self.client = genai.GenerativeModel(
+                    self.model_name,
+                    generation_config=generation_config,
+                )
                 self.online = True
             except Exception as exc:  # noqa: BLE001
                 print(f"[MissionCommanderLLM] Failed to init Gemini model: {exc}")
@@ -114,8 +132,33 @@ class MissionCommanderLLM:
             except Exception as exc:  # noqa: BLE001
                 print(f"[MissionCommanderLLM] LLM request failed: {exc}")
 
-        # Heuristic fallback (no token or API failure)
-        return self._heuristic_decision(lidar, drone_pos, step_idx)
+        # Heuristic fallback (removed)
+        raise RuntimeError("LLM call failed and heuristic fallback is disabled.")
+
+    def get_waypoint_plan(
+        self,
+        lidar: Sequence[float],
+        drone_pos: Sequence[float],
+        sensor_report: str,
+        *,
+        max_points: int = 5,
+        allow_llm: bool = True,
+    ) -> WaypointPlan:
+        """
+        Ask the planner for a short list of sub-goals. Intended to be called once per episode.
+        """
+        if allow_llm and self.online and self.client is not None:
+            try:
+                sys_prompt = self._build_system_prompt()
+                user_prompt = self._build_plan_prompt(lidar, drone_pos, sensor_report, max_points)
+                raw = self._call_llm(sys_prompt, user_prompt)
+                plan = self._parse_plan_response(raw, drone_pos, max_points)
+                plan.source = "llm"
+                return plan
+            except Exception as exc:  # noqa: BLE001
+                print(f"[MissionCommanderLLM] LLM waypoint request failed: {exc}")
+
+        raise RuntimeError("LLM call failed and heuristic fallback is disabled.")
 
     # ----------------------------------------------------------------- helpers
     def _build_system_prompt(self) -> str:
@@ -124,7 +167,7 @@ class MissionCommanderLLM:
             "The drone already has a low-level controller; you only provide the next "
             "sub-goal. Follow these rules strictly:\n"
             f"- Keep the drone within ±{self.arena_radius} meters on X/Y.\n"
-            f"- Keep altitude between {self.min_z:.1f} and {self.max_z:.1f} meters.\n"
+            "- ALWAYS set altitude (Z) to exactly 1.5 meters for all waypoints.\n"
             f"- Limit each hop to {self.max_step:.1f} meters from the current position.\n"
             "- If survivors are known, move toward the nearest before exploring.\n"
             '- Respond ONLY with JSON: {"instruction": "...", "subgoal": [x,y,z], "reason": "..."}\n'
@@ -149,6 +192,31 @@ class MissionCommanderLLM:
             "Provide the JSON object now."
         )
 
+    def _build_plan_prompt(
+        self,
+        lidar: Sequence[float],
+        drone_pos: Sequence[float],
+        sensor_report: str,
+        max_points: int,
+    ) -> str:
+        lidar_preview = ", ".join(f"{float(v):.2f}" for v in lidar[:12])
+        return (
+            "Mission Commander, reply with strict JSON using keys "
+            '"waypoints", "instruction", "reason". No markdown.\n'
+            f"Mission story / objective: {self.mission_story}\n"
+            f"Current drone position (meters): {list(map(lambda v: round(float(v), 3), drone_pos))}\n"
+            f"Sensor report: {sensor_report}\n"
+            f"Lidar readings (first 12 of {len(lidar)}): [{lidar_preview} ...]\n"
+            f"Full lidar list: {list(map(lambda v: round(float(v), 3), lidar))}\n"
+            f"Generate EXACTLY {max_points} sequential waypoints to form a continuous exploration path. "
+            f"Each waypoint must be within {self.max_step:.1f} meters of the previous point, "
+            f"advancing the search in the requested direction while avoiding known obstacles. "
+            f"Stay inside ±{self.arena_radius} meters on X/Y.\n"
+            "CRITICAL: Set Z (altitude) to EXACTLY 1.5 meters for ALL waypoints. Never vary the altitude.\n"
+            'JSON schema example: {"waypoints": [[x1,y1,1.5], [x2,y2,1.5], ...], '
+            '"instruction": "...", "reason": "..."}'
+        )
+
     def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
         if self.client is None:
             raise RuntimeError("LLM client not initialised")
@@ -158,7 +226,7 @@ class MissionCommanderLLM:
             generation_config=genai.types.GenerationConfig(
                 temperature=self.temperature,
                 top_p=0.9,
-                max_output_tokens=220,
+                max_output_tokens=2048,  # Increased from 220 to support 20 waypoints
             ),
         )
         text_parts = []
@@ -186,6 +254,52 @@ class MissionCommanderLLM:
         subgoal = self._clamp_subgoal(subgoal, drone_pos)
         return LLMDecision(subgoal=subgoal, instruction=instruction, reason=reason, source="llm")
 
+    def _parse_plan_response(
+        self,
+        raw: str,
+        start_pos: Sequence[float],
+        max_points: int,
+    ) -> WaypointPlan:
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z0-9]*\s*", "", cleaned)
+            cleaned = cleaned.rstrip("`").strip()
+        match = re.search(r"\{.*\}", cleaned, flags=re.S)
+        if match:
+            cleaned = match.group(0)
+        
+        # Fix common JSON syntax errors (e.g., trailing commas)
+        cleaned = re.sub(r",\s*([\]}])", r"\1", cleaned)
+        # Fix missing commas between array elements (e.g., [1,2,3] [4,5,6])
+        cleaned = re.sub(r"\]\s*\[", "], [", cleaned)
+        
+        try:
+            payload: Dict[str, Any] = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            print(f"[DEBUG] Raw LLM response (full):\n{raw}")
+            print(f"[DEBUG] Cleaned JSON (full):\n{cleaned}")
+            raise exc
+        waypoints_raw = payload.get("waypoints")
+        if not isinstance(waypoints_raw, list):
+            waypoints_raw = [payload.get("subgoal")]
+
+        parsed: List[List[float]] = []
+        anchor = list(map(float, start_pos[:3]))
+        for candidate in waypoints_raw:
+            if len(parsed) >= max_points:
+                break
+            subgoal = self._coerce_subgoal(candidate, anchor)
+            clamped = self._clamp_subgoal(subgoal, anchor)
+            parsed.append(clamped)
+            anchor = clamped
+
+        if not parsed:
+            parsed.append(self._clamp_subgoal(self._coerce_subgoal(None, start_pos), start_pos))
+
+        instruction = str(payload.get("instruction", "Follow the planned sweep."))
+        reason = str(payload.get("reason", "LLM route plan"))
+        return WaypointPlan(waypoints=parsed, instruction=instruction, reason=reason, source="llm")
+
     def _coerce_subgoal(
         self, candidate: Any, drone_pos: Sequence[float]
     ) -> List[float]:
@@ -203,6 +317,14 @@ class MissionCommanderLLM:
         self, subgoal: Sequence[float], drone_pos: Sequence[float]
     ) -> List[float]:
         gx, gy, gz = map(float, subgoal)
+
+        # Validate waypoint isn't too close (dead zone)
+        dist_2d = math.sqrt((gx - float(drone_pos[0]))**2 + (gy - float(drone_pos[1]))**2)
+        if dist_2d < 0.5:  # Less than 0.5m away
+            print(f"[WARNING] Waypoint too close ({dist_2d:.2f}m), adjusting...")
+            angle = random.random() * 2 * math.pi
+            gx = float(drone_pos[0]) + 1.0 * math.cos(angle)
+            gy = float(drone_pos[1]) + 1.0 * math.sin(angle)
 
         # Limit hop distance
         dx = gx - float(drone_pos[0])
@@ -222,44 +344,7 @@ class MissionCommanderLLM:
             gx *= factor
             gy *= factor
 
-        gz = max(self.min_z, min(self.max_z, gz))
+        # FORCE altitude to 1.5m regardless of LLM output
+        gz = 1.5
         return [gx, gy, gz]
 
-    # ---------------------------------------------------------- heuristics
-    def _heuristic_decision(
-        self,
-        lidar: Sequence[float],
-        drone_pos: Sequence[float],
-        step_idx: int,
-    ) -> LLMDecision:
-        """Simple rule-based navigator as a safety net."""
-        drone_xy = (float(drone_pos[0]), float(drone_pos[1]))
-        drone_z = float(drone_pos[2])
-
-        # Pick a safe direction based on lidar gaps
-        safest_idx = self._select_safest_ray(lidar)
-        angle = 2 * math.pi * safest_idx / max(len(lidar), 1)
-        step = self.max_step
-        target = [
-            drone_xy[0] + step * math.cos(angle),
-            drone_xy[1] + step * math.sin(angle),
-            drone_z,
-        ]
-        # Add a slow rotation over time to avoid stagnation
-        jitter = (step_idx % 60) / 60.0 * math.pi / 6.0
-        target[0] += math.cos(angle + jitter) * 0.5
-        target[1] += math.sin(angle + jitter) * 0.5
-        target = self._clamp_subgoal(target, drone_pos)
-        return LLMDecision(
-            subgoal=target,
-            instruction="Explore the safest open corridor while scanning for survivors.",
-            reason="Heuristic sweep",
-            source="heuristic",
-        )
-
-    def _select_safest_ray(self, lidar: Sequence[float]) -> int:
-        if not lidar:
-            return 0
-        max_value = max(lidar)
-        candidates = [i for i, v in enumerate(lidar) if math.isclose(v, max_value, abs_tol=1e-2)]
-        return random.choice(candidates)
