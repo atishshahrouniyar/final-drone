@@ -35,13 +35,14 @@ GOAL_MIN_DIST = 3.0
 GOAL_MAX_DIST = 5.0
 SUCCESS_THRESHOLD = 0.3
 PROXIMITY_THRESHOLD = 0.1
-PROXIMITY_PENALTY = -1.0  # Increased from -0.5 for stronger obstacle avoidance
-COLLISION_PENALTY = -100.0  # Increased from -40.0 for much harsher penalty
+PROXIMITY_PENALTY = -1.0  # Strong penalty only when extremely close to obstacles
+COLLISION_PENALTY = -100.0  # Very harsh penalty for actual collisions
 SUCCESS_REWARD = 20.0
 HUMAN_FOUND_REWARD = SUCCESS_REWARD
 HUMAN_DETECTION_RADIUS = 0.6
-MIN_SAFE_ALTITUDE = 0.6
-GROUND_CLEARANCE_PENALTY = -8.0
+MIN_SAFE_ALTITUDE = 0.2
+# Softer penalty for flying below the minimum safe altitude so the drone can skim closer
+GROUND_CLEARANCE_PENALTY = -3.0
 RUNS_ROOT = "./runs"
 CHECKPOINT_MILESTONES = [100_000, 250_000, 500_000, 750_000, 1_000_000]  # More frequent checkpoints
 EVAL_FREQUENCY = 100_000  # Reduced from 50_000 (evaluate less often)
@@ -361,14 +362,8 @@ class RandomPointNavEnv(gym.Env):
             reward += prev_dist - dist_to_goal
         self.prev_dist = dist_to_goal
 
-        # Proximity penalty
+        # Proximity penalty (only when extremely close to obstacles; being near is allowed)
         reward += self._proximity_penalty(lidar)
-        
-        # Bonus for maintaining safe distance from obstacles (encourage collision-free flying)
-        min_norm = float(np.min(lidar))
-        min_lidar_dist = min_norm * self.lidar_range
-        if min_lidar_dist > 1.0:  # Safe distance maintained
-            reward += 0.1  # Small bonus for safe flying
 
         # Strongly discourage skimming the ground (common failure mode)
         if new_pos[2] < MIN_SAFE_ALTITUDE:
