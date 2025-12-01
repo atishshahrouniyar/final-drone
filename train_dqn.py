@@ -90,8 +90,8 @@ class TrainingLogger(BaseCallback):
                 'episode': self.locals.get('episode_num', 0),
                 'fps': fps,
                 'elapsed_time': elapsed,
-                'ep_len_mean': self.locals.get('ep_len_mean', 0),
-                'ep_rew_mean': self.locals.get('ep_rew_mean', 0),
+                'ep_len_mean': self.model.logger.name_to_value.get('rollout/ep_len_mean', 0),
+                'ep_rew_mean': self.model.logger.name_to_value.get('rollout/ep_rew_mean', 0),
                 'train/loss': self.model.logger.name_to_value.get('train/loss', 0),
                 'train/learning_rate': self.model.logger.name_to_value.get('train/learning_rate', 0),
                 'train/n_updates': self.model.logger.name_to_value.get('train/n_updates', 0),
@@ -164,6 +164,8 @@ class DetailedMetricsCallback(BaseCallback):
     def _on_step(self) -> bool:
         if self.n_calls % self.log_freq == 0:
             try:
+                import torch
+                
                 # Access DQN internals
                 replay_buffer = self.model.replay_buffer
                 
@@ -171,21 +173,21 @@ class DetailedMetricsCallback(BaseCallback):
                 if replay_buffer.size() > self.model.batch_size:
                     replay_data = replay_buffer.sample(self.model.batch_size)
                     
-                    with self.model.policy.q_net.eval():
+                    # Use torch.no_grad() instead of eval() context manager
+                    with torch.no_grad():
                         q_values = self.model.policy.q_net(replay_data.observations)
-                        q_value_mean = float(q_values.mean().detach().cpu().numpy())
-                        q_value_std = float(q_values.std().detach().cpu().numpy())
-                        q_value_max = float(q_values.max().detach().cpu().numpy())
-                        q_value_min = float(q_values.min().detach().cpu().numpy())
+                        q_value_mean = float(q_values.mean().cpu().numpy())
+                        q_value_std = float(q_values.std().cpu().numpy())
+                        q_value_max = float(q_values.max().cpu().numpy())
+                        q_value_min = float(q_values.min().cpu().numpy())
                     
-                    # Compute TD errors
-                    with self.model.policy.q_net_target.eval():
+                        # Compute TD errors
                         next_q_values = self.model.policy.q_net_target(replay_data.next_observations)
                         max_next_q_values = next_q_values.max(dim=1)[0]
                         target_q_values = replay_data.rewards.flatten() + (1 - replay_data.dones.flatten()) * self.model.gamma * max_next_q_values
                         
                         current_q_values = q_values.gather(1, replay_data.actions.long()).squeeze()
-                        td_errors = (target_q_values - current_q_values).detach().cpu().numpy()
+                        td_errors = (target_q_values - current_q_values).cpu().numpy()
                         td_error_mean = float(np.mean(np.abs(td_errors)))
                         td_error_std = float(np.std(td_errors))
                 else:
@@ -213,7 +215,8 @@ class DetailedMetricsCallback(BaseCallback):
                     ])
                     
             except Exception as e:
-                print(f"[DetailedMetrics] Warning: Could not collect metrics: {e}")
+                # Silently skip if metrics can't be collected (don't spam console)
+                pass
         
         return True
 
