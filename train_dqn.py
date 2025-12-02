@@ -8,11 +8,14 @@ import os
 from datetime import datetime
 import time
 from typing import Tuple
+import json
+import csv
 
 from packaging import version
 
 import numpy as np
 import pybullet as p
+import torch
 from stable_baselines3 import DQN, __version__ as SB3_VERSION
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, EvalCallback
 from stable_baselines3.common.monitor import Monitor
@@ -84,6 +87,218 @@ class MilestoneCheckpoint(BaseCallback):
                 self.model.save(path)
                 print(f"[Checkpoint] Saved model at {milestone:,} steps -> {path}.zip")
                 self.saved.add(milestone)
+        return True
+
+
+class DetailedMetricsCallback(BaseCallback):
+    """
+    Logs comprehensive training metrics including Q-values, TD error, etc.
+    """
+    def __init__(self, log_freq: int = 1000, save_dir: str = "./metrics"):
+        super().__init__()
+        self.log_freq = log_freq
+        self.save_dir = save_dir
+        os.makedirs(self.save_dir, exist_ok=True)
+        
+        # CSV file for detailed metrics
+        self.csv_path = os.path.join(self.save_dir, "detailed_metrics.csv")
+        self.csv_file = None
+        self.csv_writer = None
+        
+        # Metrics storage
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.episode_successes = []
+        self.episode_collisions = []
+        
+    def _on_training_start(self) -> None:
+        """Initialize CSV file with headers."""
+        self.csv_file = open(self.csv_path, 'w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow([
+            'timestep',
+            'q_value_mean',
+            'q_value_std',
+            'q_value_max',
+            'q_value_min',
+            'td_error_mean',
+            'td_error_std',
+            'loss',
+            'exploration_rate',
+            'learning_rate',
+            'episode_reward_mean',
+            'episode_length_mean',
+            'success_rate',
+            'collision_rate',
+        ])
+        self.csv_file.flush()
+        
+    def _on_step(self) -> bool:
+        # Collect episode statistics from info
+        infos = self.locals.get('infos', [])
+        for info in infos:
+            if 'episode' in info:
+                ep_info = info['episode']
+                self.episode_rewards.append(ep_info['r'])
+                self.episode_lengths.append(ep_info['l'])
+                
+            # Track success and collision rates
+            if 'is_success' in info:
+                self.episode_successes.append(1 if info['is_success'] else 0)
+            if 'is_collision' in info:
+                self.episode_collisions.append(1 if info['is_collision'] else 0)
+        
+        # Log detailed metrics at specified frequency
+        if self.n_calls % self.log_freq == 0:
+            metrics = self._collect_metrics()
+            if metrics and self.csv_writer:
+                self.csv_writer.writerow([
+                    self.num_timesteps,
+                    metrics.get('q_value_mean', 0),
+                    metrics.get('q_value_std', 0),
+                    metrics.get('q_value_max', 0),
+                    metrics.get('q_value_min', 0),
+                    metrics.get('td_error_mean', 0),
+                    metrics.get('td_error_std', 0),
+                    metrics.get('loss', 0),
+                    metrics.get('exploration_rate', 0),
+                    metrics.get('learning_rate', 0),
+                    metrics.get('episode_reward_mean', 0),
+                    metrics.get('episode_length_mean', 0),
+                    metrics.get('success_rate', 0),
+                    metrics.get('collision_rate', 0),
+                ])
+                self.csv_file.flush()
+                
+                # Log to tensorboard as well
+                for key, value in metrics.items():
+                    self.logger.record(f"detailed/{key}", value)
+        
+        return True
+    
+    def _collect_metrics(self):
+        """Collect Q-values, TD errors, and other metrics from the model."""
+        try:
+            metrics = {}
+            
+            # Get replay buffer
+            if hasattr(self.model, 'replay_buffer') and self.model.replay_buffer.size() > 0:
+                # Sample from replay buffer to estimate Q-values
+                replay_data = self.model.replay_buffer.sample(min(256, self.model.replay_buffer.size()))
+                
+                with torch.no_grad():
+                    # Get Q-values for current states
+                    q_values = self.model.q_net(replay_data.observations)
+                    q_values_np = q_values.cpu().numpy()
+                    
+                    metrics['q_value_mean'] = float(np.mean(q_values_np))
+                    metrics['q_value_std'] = float(np.std(q_values_np))
+                    metrics['q_value_max'] = float(np.max(q_values_np))
+                    metrics['q_value_min'] = float(np.min(q_values_np))
+                    
+                    # Compute TD error
+                    next_q_values = self.model.q_net_target(replay_data.next_observations)
+                    next_q_values, _ = next_q_values.max(dim=1)
+                    target_q_values = replay_data.rewards.flatten() + (1 - replay_data.dones.flatten()) * self.model.gamma * next_q_values
+                    
+                    current_q_values = q_values.gather(1, replay_data.actions.long()).squeeze()
+                    td_errors = torch.abs(target_q_values - current_q_values).cpu().numpy()
+                    
+                    metrics['td_error_mean'] = float(np.mean(td_errors))
+                    metrics['td_error_std'] = float(np.std(td_errors))
+            
+            # Get training loss (from logger)
+            if hasattr(self.model, 'logger') and self.model.logger.name_to_value:
+                metrics['loss'] = self.model.logger.name_to_value.get('train/loss', 0)
+            
+            # Get exploration rate
+            metrics['exploration_rate'] = self.model.exploration_rate
+            
+            # Get learning rate
+            if hasattr(self.model, 'lr_schedule'):
+                metrics['learning_rate'] = self.model.lr_schedule(self.model._current_progress_remaining)
+            
+            # Episode statistics
+            if self.episode_rewards:
+                metrics['episode_reward_mean'] = np.mean(self.episode_rewards[-100:])
+            if self.episode_lengths:
+                metrics['episode_length_mean'] = np.mean(self.episode_lengths[-100:])
+            if self.episode_successes:
+                metrics['success_rate'] = np.mean(self.episode_successes[-100:])
+            if self.episode_collisions:
+                metrics['collision_rate'] = np.mean(self.episode_collisions[-100:])
+            
+            # Buffer statistics
+            if hasattr(self.model, 'replay_buffer'):
+                buffer_size = self.model.replay_buffer.size()
+                buffer_capacity = self.model.replay_buffer.buffer_size
+                metrics['buffer_size'] = buffer_size
+                metrics['sample_reuse_ratio'] = self.num_timesteps / max(buffer_size, 1)
+                self.logger.record("detailed/buffer_size", buffer_size)
+                self.logger.record("detailed/buffer_capacity", buffer_capacity)
+                self.logger.record("detailed/sample_reuse_ratio", metrics['sample_reuse_ratio'])
+            
+            return metrics
+            
+        except Exception as e:
+            print(f"[DetailedMetrics] Warning: Could not collect metrics: {e}")
+            return {}
+    
+    def _on_training_end(self) -> None:
+        """Close CSV file."""
+        if self.csv_file:
+            self.csv_file.close()
+            print(f"[DetailedMetrics] Saved metrics to {self.csv_path}")
+
+
+class TrainingConfigSaver(BaseCallback):
+    """Save training configuration and hyperparameters."""
+    
+    def __init__(self, save_path: str):
+        super().__init__()
+        self.save_path = save_path
+    
+    def _on_training_start(self) -> None:
+        """Save configuration at start of training."""
+        config = {
+            'timestamp': datetime.now().isoformat(),
+            'total_timesteps': TOTAL_TIMESTEPS,
+            'learning_rate': LEARNING_RATE,
+            'buffer_size': BUFFER_SIZE,
+            'batch_size': BATCH_SIZE,
+            'gamma': GAMMA,
+            'target_update_interval': TARGET_UPDATE_INTERVAL,
+            'action_repeat': ACTION_REPEAT,
+            'arena_radius': ARENA_RADIUS,
+            'goal_min_dist': GOAL_MIN_DIST,
+            'goal_max_dist': GOAL_MAX_DIST,
+            'success_threshold': SUCCESS_THRESHOLD,
+            'proximity_threshold': PROXIMITY_THRESHOLD,
+            'proximity_penalty': PROXIMITY_PENALTY,
+            'collision_penalty': COLLISION_PENALTY,
+            'success_reward': SUCCESS_REWARD,
+            'min_altitude': MIN_ALTITUDE,
+            'max_altitude': MAX_ALTITUDE,
+            'eval_frequency': EVAL_FREQUENCY,
+            'eval_episodes': EVAL_EPISODES,
+            'max_episode_steps': 2000,
+            'sb3_version': SB3_VERSION,
+        }
+        
+        # Save model hyperparameters
+        if hasattr(self.model, 'learning_rate'):
+            config['model_learning_rate'] = float(self.model.learning_rate)
+        if hasattr(self.model, 'exploration_fraction'):
+            config['exploration_fraction'] = float(self.model.exploration_fraction)
+        if hasattr(self.model, 'exploration_initial_eps'):
+            config['exploration_initial_eps'] = float(self.model.exploration_initial_eps)
+        if hasattr(self.model, 'exploration_final_eps'):
+            config['exploration_final_eps'] = float(self.model.exploration_final_eps)
+        
+        with open(self.save_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        
+        print(f"[Config] Saved training configuration to {self.save_path}")
         return True
 
 
@@ -301,9 +516,18 @@ def train():
     tensorboard_dir = os.path.join(run_dir, "tensorboard")
     eval_log_dir = os.path.join(run_dir, "eval_logs")
 
+    metrics_dir = os.path.join(run_dir, "metrics")
+    
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(tensorboard_dir, exist_ok=True)
     os.makedirs(eval_log_dir, exist_ok=True)
+    os.makedirs(metrics_dir, exist_ok=True)
+
+    print("=" * 70)
+    print("Training Configuration Saved: {}".format(
+        os.path.join(run_dir, "training_config.json")
+    ))
+    print("=" * 70)
 
     # Create environments with TimeLimit wrapper to prevent infinite episodes
     # 2000 steps = ~33 seconds of simulation time (sufficient for 40x40m arena)
@@ -315,7 +539,11 @@ def train():
     eval_env = TimeLimit(eval_env, max_episode_steps=2000)
     eval_env = Monitor(eval_env)
 
+    # Create comprehensive callbacks
+    config_saver = TrainingConfigSaver(os.path.join(run_dir, "training_config.json"))
     checkpoint_cb = MilestoneCheckpoint(CHECKPOINT_MILESTONES, checkpoint_dir)
+    detailed_metrics_cb = DetailedMetricsCallback(log_freq=1000, save_dir=metrics_dir)
+    training_logger_cb = TrainingLogger(check_freq=5000)
     eval_cb = EvalCallback(
         eval_env,
         best_model_save_path=checkpoint_dir,
@@ -324,7 +552,19 @@ def train():
         n_eval_episodes=EVAL_EPISODES,
         deterministic=True,
     )
-    callback = CallbackList([TrainingLogger(), checkpoint_cb, eval_cb])
+    
+    callback = CallbackList([
+        config_saver,
+        training_logger_cb,
+        detailed_metrics_cb,
+        checkpoint_cb,
+        eval_cb
+    ])
+    
+    print("=" * 70)
+    print("Starting Training: {:,} timesteps".format(TOTAL_TIMESTEPS))
+    print("Logs: {}".format(run_dir))
+    print("=" * 70)
 
     model = DQN(
         "MlpPolicy",
@@ -344,12 +584,65 @@ def train():
         device="auto",
     )
 
+    start_time = time.time()
+    
     try:
         model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callback)
     finally:
+        # Save final model
         model_path = os.path.join(run_dir, f"dqn_random_point_nav_{timestamp}")
         model.save(model_path)
-        print(f"Saved model to {model_path}.zip")
+        print(f"\n[Training Complete] Saved model to {model_path}.zip")
+        
+        # Create training summary
+        training_time = time.time() - start_time
+        summary = {
+            'training_completed': datetime.now().isoformat(),
+            'total_training_time_seconds': training_time,
+            'total_training_time_hours': training_time / 3600,
+            'total_timesteps': TOTAL_TIMESTEPS,
+            'final_exploration_rate': float(model.exploration_rate),
+            'final_buffer_size': model.replay_buffer.size() if hasattr(model, 'replay_buffer') else 0,
+        }
+        
+        # Add final episode statistics if available
+        if hasattr(detailed_metrics_cb, 'episode_rewards') and detailed_metrics_cb.episode_rewards:
+            recent_rewards = detailed_metrics_cb.episode_rewards[-100:]
+            recent_lengths = detailed_metrics_cb.episode_lengths[-100:]
+            recent_successes = detailed_metrics_cb.episode_successes[-100:]
+            recent_collisions = detailed_metrics_cb.episode_collisions[-100:]
+            
+            summary['final_metrics'] = {
+                'episode_reward_mean': float(np.mean(recent_rewards)),
+                'episode_reward_std': float(np.std(recent_rewards)),
+                'episode_length_mean': float(np.mean(recent_lengths)),
+                'episode_length_std': float(np.std(recent_lengths)),
+                'success_rate': float(np.mean(recent_successes)),
+                'collision_rate': float(np.mean(recent_collisions)),
+                'total_episodes': len(detailed_metrics_cb.episode_rewards),
+            }
+        
+        # Save summary
+        summary_path = os.path.join(run_dir, "training_summary.json")
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        print("\n" + "=" * 70)
+        print("Training Summary")
+        print("=" * 70)
+        print(f"Total time: {training_time/3600:.2f} hours")
+        print(f"Final exploration rate: {summary['final_exploration_rate']:.4f}")
+        if 'final_metrics' in summary:
+            fm = summary['final_metrics']
+            print(f"Final episode reward: {fm['episode_reward_mean']:.2f} ± {fm['episode_reward_std']:.2f}")
+            print(f"Final episode length: {fm['episode_length_mean']:.1f} ± {fm['episode_length_std']:.1f}")
+            print(f"Final success rate: {fm['success_rate']*100:.1f}%")
+            print(f"Final collision rate: {fm['collision_rate']*100:.1f}%")
+            print(f"Total episodes: {fm['total_episodes']}")
+        print(f"\nSummary saved to: {summary_path}")
+        print("=" * 70)
+        
+        # Close environments
         env.close()
         eval_env.close()
 
