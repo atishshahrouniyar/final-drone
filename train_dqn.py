@@ -45,6 +45,7 @@ MAX_ALTITUDE = 3.0
 
 import gymnasium as gym
 from gymnasium import spaces
+from gymnasium.wrappers import TimeLimit
 
 
 class TrainingLogger(BaseCallback):
@@ -124,7 +125,7 @@ class RandomPointNavEnv(gym.Env):
 
         # Observation space: lidar(36) + goal distance + goal angle + altitude delta
         self.lidar_rays = 36
-        self.lidar_range = 3.0
+        self.lidar_range = 6.0
         low = np.array([0.0] * self.lidar_rays + [0.0, -np.pi, -1.0], dtype=np.float32)
         high = np.array([1.0] * self.lidar_rays + [1.0, np.pi, 1.0], dtype=np.float32)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
@@ -219,16 +220,22 @@ class RandomPointNavEnv(gym.Env):
 
         terminated = False
         truncated = False
+        
+        # Track episode outcomes separately
+        is_collision = False
+        is_success = False
 
         # Collision penalty
         if p.getContactPoints(bodyA=self.drone_id, physicsClientId=self.client):
             reward += COLLISION_PENALTY
             terminated = True
+            is_collision = True
 
         # Success reward
         if dist_to_goal < SUCCESS_THRESHOLD:
             reward += SUCCESS_REWARD
             terminated = True
+            is_success = True
 
         goal_dist_norm = min(dist_to_goal / GOAL_MAX_DIST, 1.0)
         rel_angle = (math.atan2(self.goal_pos[1] - new_pos[1], self.goal_pos[0] - new_pos[0]) - yaw + math.pi) % (
@@ -236,7 +243,13 @@ class RandomPointNavEnv(gym.Env):
         ) - math.pi
         altitude_delta = np.clip((self.goal_pos[2] - new_pos[2]) / (MAX_ALTITUDE - MIN_ALTITUDE), -1.0, 1.0)
         obs = np.concatenate([lidar, np.array([goal_dist_norm, rel_angle, altitude_delta], dtype=np.float32)])
-        info = {}
+        
+        # Add episode outcome info
+        info = {
+            'is_success': is_success,
+            'is_collision': is_collision,
+        }
+        
         return obs, reward, terminated, truncated, info
 
     # ---------------------------------------------------------------- utilities
@@ -292,8 +305,15 @@ def train():
     os.makedirs(tensorboard_dir, exist_ok=True)
     os.makedirs(eval_log_dir, exist_ok=True)
 
-    env = Monitor(RandomPointNavEnv(gui=False))
-    eval_env = Monitor(RandomPointNavEnv(gui=False))
+    # Create environments with TimeLimit wrapper to prevent infinite episodes
+    # 2000 steps = ~33 seconds of simulation time (sufficient for 40x40m arena)
+    env = RandomPointNavEnv(gui=False)
+    env = TimeLimit(env, max_episode_steps=2000)
+    env = Monitor(env)
+    
+    eval_env = RandomPointNavEnv(gui=False)
+    eval_env = TimeLimit(eval_env, max_episode_steps=2000)
+    eval_env = Monitor(eval_env)
 
     checkpoint_cb = MilestoneCheckpoint(CHECKPOINT_MILESTONES, checkpoint_dir)
     eval_cb = EvalCallback(
