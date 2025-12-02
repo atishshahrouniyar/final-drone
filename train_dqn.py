@@ -33,11 +33,11 @@ TARGET_UPDATE_INTERVAL = 500
 ACTION_REPEAT = 4
 ARENA_RADIUS = 20.0  # 40 x 40 meters
 GOAL_MIN_DIST = 3.0
-GOAL_MAX_DIST = 5.0
-SUCCESS_THRESHOLD = 0.3
+GOAL_MAX_DIST = 7.0
+SUCCESS_THRESHOLD = 0.2
 PROXIMITY_THRESHOLD = 0.1
 PROXIMITY_PENALTY = -0.5
-COLLISION_PENALTY = -15.0
+COLLISION_PENALTY = -25.0
 SUCCESS_REWARD = 20.0
 RUNS_ROOT = "./runs"
 CHECKPOINT_MILESTONES = [500_000]
@@ -368,7 +368,7 @@ class RandomPointNavEnv(gym.Env):
             ang = self._rng.uniform(0, 2 * math.pi)
             gx = start_xyz[0] + dist * math.cos(ang)
             gy = start_xyz[1] + dist * math.sin(ang)
-            if math.hypot(gx, gy) <= self.radius - 1.0 and self.scene._valid(gx, gy, min_sep=0.5):
+            if math.hypot(gx, gy) <= self.radius - 1.0 and self.scene._valid(gx, gy, min_sep=0.2):
                 gz = float(self._rng.uniform(MIN_ALTITUDE, MAX_ALTITUDE))
                 return np.array([gx, gy, gz], dtype=np.float32)
         return np.array(
