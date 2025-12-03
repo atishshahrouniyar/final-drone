@@ -5,9 +5,9 @@ Visualize the trained random-point navigation policy with PyBullet GUI.
 Usage:
     python test_trained_model.py [model_path] [num_episodes] [max_steps]
 Defaults:
-    model_path      = "dqn_random_point_nav"
-    num_episodes    = 5
-    max_steps       = 400
+    model_path      = "runs/latest/checkpoints/best_model.zip"
+    num_episodes    = 20
+    max_steps       = 2000
 """
 
 import sys
@@ -16,6 +16,7 @@ from typing import Tuple
 
 import numpy as np
 import pybullet as p
+from gymnasium.wrappers import TimeLimit
 from stable_baselines3 import DQN
 
 from train_dqn import RandomPointNavEnv
@@ -33,7 +34,7 @@ def _detect_human_pixels(image: np.ndarray):
         & (rgb[:, :, 2] < 140)
     )
     count = int(np.count_nonzero(mask))
-    if count < 150:
+    if count < 75:  # Lowered threshold for better detection
         return False, None, count
     ys, xs = np.where(mask)
     center = (int(xs.mean()), int(ys.mean()))
@@ -76,23 +77,31 @@ def test_model(
 
     print("\nCreating GUI environment...")
     env = RandomPointNavEnv(gui=True)
+    env = TimeLimit(env, max_episode_steps=2000)  # Match training setup
+    
+    # Get reference to base environment for accessing scene attributes
+    base_env = env.unwrapped
+    
     episode_rewards = []
     episode_lengths = []
+    episode_collisions = 0
+    episode_successes = 0
+    episode_timeouts = 0
 
     try:
         for episode in range(1, num_episodes + 1):
             obs = _unwrap_reset(env.reset())
 
-            start = getattr(env, "start_pos", None)
-            goal = getattr(env, "goal_pos", None)
+            start = getattr(base_env, "start_pos", None)
+            goal = getattr(base_env, "goal_pos", None)
             if start is not None and goal is not None:
                 print(
                     "Start: ({:.2f}, {:.2f}, {:.2f})  ->  Goal: ({:.2f}, {:.2f}, {:.2f})".format(
                         start[0], start[1], start[2], goal[0], goal[1], goal[2]
                     )
                 )
-            if hasattr(env.scene, "_update_camera"):
-                env.scene._update_camera()
+            if hasattr(base_env.scene, "_update_camera"):
+                base_env.scene._update_camera()
 
             ep_reward = 0.0
             steps = 0
@@ -105,20 +114,20 @@ def test_model(
                 action, _ = model.predict(obs, deterministic=True)
                 obs, reward, terminated, truncated, info = _unwrap_step(env.step(action))
 
-                if hasattr(env.scene, "_update_camera"):
-                    env.scene._update_camera()
-                if hasattr(env.scene, "client") and env.scene.client is not None:
+                if hasattr(base_env.scene, "_update_camera"):
+                    base_env.scene._update_camera()
+                if hasattr(base_env.scene, "client") and base_env.scene.client is not None:
                     try:
-                        pos, orn = p.getBasePositionAndOrientation(env.scene.drone_id, physicsClientId=env.scene.client)
+                        pos, orn = p.getBasePositionAndOrientation(base_env.scene.drone_id, physicsClientId=base_env.scene.client)
                         yaw = p.getEulerFromQuaternion(orn)[2]
-                        lidar_hits = env._get_lidar(pos, yaw)
-                        env.scene._render_lidar_overlay(pos, yaw, lidar_hits)
+                        lidar_hits = base_env._get_lidar(pos, yaw)
+                        base_env.scene._render_lidar_overlay(pos, yaw, lidar_hits)
                     except Exception:
                         pass
 
                 camera_frame = None
-                if hasattr(env.scene, "_get_drone_camera_image"):
-                    camera_frame = env.scene._get_drone_camera_image()
+                if hasattr(base_env.scene, "_get_drone_camera_image"):
+                    camera_frame = base_env.scene._get_drone_camera_image()
                 detected, center, pix_count = _detect_human_pixels(camera_frame)
                 if detected and not human_spotted:
                     print(f"  ✓ Human detected through camera at pixels {center} (mask={pix_count})")
@@ -130,7 +139,20 @@ def test_model(
 
             episode_rewards.append(ep_reward)
             episode_lengths.append(steps)
-            status = "SUCCESS" if terminated and not truncated else "TIMEOUT"
+            
+            # Properly detect episode outcome from info dict
+            if info.get('is_collision', False):
+                status = "COLLISION ⚠️"
+                episode_collisions += 1
+            elif info.get('is_success', False):
+                status = "SUCCESS ✓"
+                episode_successes += 1
+            elif truncated:
+                status = "TIMEOUT ⏱️"
+                episode_timeouts += 1
+            else:
+                status = "UNKNOWN"
+            
             print(f"Reward: {ep_reward:.2f} | Steps: {steps} | Status: {status}")
             time.sleep(0.5)
 
@@ -147,6 +169,14 @@ def test_model(
             print(f"Average length: {np.mean(episode_lengths):.1f} ± {np.std(episode_lengths):.1f}")
             print(f"Best reward: {np.max(episode_rewards):.2f}")
             print(f"Worst reward: {np.min(episode_rewards):.2f}")
+            
+            print("\n" + "=" * 70)
+            print("Outcome Statistics")
+            print("=" * 70)
+            total_eps = len(episode_rewards)
+            print(f"  Successes:  {episode_successes}/{total_eps} ({100*episode_successes/total_eps:.1f}%)")
+            print(f"  Collisions: {episode_collisions}/{total_eps} ({100*episode_collisions/total_eps:.1f}%)")
+            print(f"  Timeouts:   {episode_timeouts}/{total_eps} ({100*episode_timeouts/total_eps:.1f}%)")
 
         print("\nClosing environment...")
         env.close()
@@ -156,7 +186,7 @@ def test_model(
 if __name__ == "__main__":
     model_path = sys.argv[1] if len(sys.argv) > 1 else "runs/20251202_203306/checkpoints/best_model.zip"
     num_eps = int(sys.argv[2]) if len(sys.argv) > 2 else 20
-    max_steps = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
+    max_steps = int(sys.argv[3]) if len(sys.argv) > 3 else 2000  # Match training max_episode_steps
 
     test_model(model_path=model_path, num_episodes=num_eps, max_steps_per_episode=max_steps)
 
