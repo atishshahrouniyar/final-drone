@@ -300,6 +300,10 @@ class TrainingConfigSaver(BaseCallback):
         
         print(f"[Config] Saved training configuration to {self.save_path}")
         return True
+    
+    def _on_step(self) -> bool:
+        """Called at each training step. No action needed for config saver."""
+        return True
 
 
 class RandomPointNavEnv(gym.Env):
