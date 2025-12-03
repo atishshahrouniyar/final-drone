@@ -1,0 +1,9 @@
+{
+  "training_completed": true,
+  "total_timesteps": 1000000,
+  "training_duration_seconds": 4089.044651031494,
+  "training_duration_hours": 1.1358457363976373,
+  "final_exploration_rate": 0.02,
+  "buffer_size_final": 200000,
+  "timestamp_end": "20251201_095042"
+}

@@ -1,0 +1,17 @@
+{
+  "training_completed": "2025-12-02T21:43:04.748110",
+  "total_training_time_seconds": 4193.326989650726,
+  "total_training_time_hours": 1.1648130526807574,
+  "total_timesteps": 1000000,
+  "final_exploration_rate": 0.05,
+  "final_buffer_size": 200000,
+  "final_metrics": {
+    "episode_reward_mean": 17.24420178,
+    "episode_reward_std": 16.682270824578282,
+    "episode_length_mean": 257.7,
+    "episode_length_std": 379.55770312299023,
+    "success_rate": 0.0,
+    "collision_rate": 0.0,
+    "total_episodes": 4032
+  }
+}

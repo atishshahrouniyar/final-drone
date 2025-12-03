@@ -154,7 +154,7 @@ def test_model(
 
 
 if __name__ == "__main__":
-    model_path = sys.argv[1] if len(sys.argv) > 1 else "runs/20251202_130646/checkpoints/best_model.zip"
+    model_path = sys.argv[1] if len(sys.argv) > 1 else "runs/20251202_203306/checkpoints/best_model.zip"
     num_eps = int(sys.argv[2]) if len(sys.argv) > 2 else 20
     max_steps = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
 

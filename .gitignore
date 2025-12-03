@@ -9,4 +9,3 @@
 /__pycache__/
 detailed_logs/
 tensorboard_logs/
-runs/
